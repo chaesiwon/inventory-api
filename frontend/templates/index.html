@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>장기재고 소진계획 관리 시스템</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- 로그인 -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo">🏭</div>
+    <h1>장기재고 소진계획 관리</h1>
+    <p class="login-sub">Steel Inventory Management System</p>
+    <div class="form-group"><label>아이디</label>
+      <input id="login-user" type="text" placeholder="admin" autocomplete="username"></div>
+    <div class="form-group"><label>비밀번호</label>
+      <input id="login-pw" type="password" placeholder="admin1234" autocomplete="current-password"></div>
+    <button class="btn btn-primary btn-full" onclick="App.login()">로그인</button>
+    <p id="login-err" class="error-msg"></p>
+    <p class="login-hint">기본 계정: admin / admin1234</p>
+  </div>
+</div>
+
+<!-- 메인 앱 -->
+<div id="app" class="hidden">
+  <nav class="sidebar">
+    <div class="sidebar-logo">🏭 장기재고 관리</div>
+    <ul class="sidebar-menu">
+      <li class="active" data-page="dashboard">📊 대시보드</li>
+      <li data-page="inventory">📦 재고현황<span class="ro-tag">조회전용</span></li>
+      <li data-page="plans">✏️ 소진계획 입력</li>
+      <li data-page="compare">📈 계획/실적 비교</li>
+      <li data-page="upload">📤 파일 업로드</li>
+      <li data-page="users" id="menu-users" style="display:none">👥 사용자 관리</li>
+    </ul>
+    <div class="sidebar-units">
+      <div class="unit-hd">⚙️ 표기 기준</div>
+      <div class="unit-row"><label>금액</label>
+        <select id="unit-amount" onchange="Units.save()">
+          <option value="KRW">원</option>
+          <option value="MN">백만원</option>
+          <option value="HM">억원</option>
+        </select>
+      </div>
+      <div class="unit-row"><label>중량</label>
+        <select id="unit-weight" onchange="Units.save()">
+          <option value="ton">ton</option>
+          <option value="kg">kg</option>
+        </select>
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <span id="sidebar-user"></span>
+      <button class="btn btn-sm btn-outline" onclick="App.logout()">로그아웃</button>
+    </div>
+  </nav>
+
+  <main class="main-content">
+
+    <!-- ══ 대시보드 ══ -->
+    <div id="page-dashboard" class="page active">
+      <div class="page-header">
+        <h2>📊 대시보드</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;color:#666">기준일:</label>
+          <select id="dash-ref" class="select-sm" onchange="Dashboard.load()"><option value="">최신</option></select>
+          <label style="font-size:12px;color:#666">비교:</label>
+          <select id="dash-compare-mode" class="select-sm" onchange="Dashboard.loadCompare()">
+            <option value="month">전월</option>
+            <option value="quarter">전분기</option>
+            <option value="year">전년도</option>
+          </select>
+        </div>
+      </div>
+      <div id="kpi-grid" class="kpi-grid"></div>
+      <!-- 비교 카드 -->
+      <div id="compare-cards" class="compare-grid"></div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">📅 월별 장기재고 추이</div>
+          <canvas id="chart-trend" height="200"></canvas>
+        </div>
+        <div class="card">
+          <div class="card-title">📅 월별 소진계획 중량 <span id="plan-wt-badge" class="unit-badge"></span></div>
+          <canvas id="chart-plan-wt" height="200"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🏭 원가중심점별 장기재고 Summary</div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>원가중심점</th><th>건수</th><th>중량</th><th>금액</th><th>소진금액</th><th>계획등록</th><th>실적확인</th><th>달성률</th></tr></thead>
+            <tbody id="cc-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">🏆 고액 장기재고 TOP 20
+          <select id="top20-ref" class="select-sm" onchange="Dashboard.loadTop20()" style="margin-left:8px"><option value="">최신</option></select>
+        </div>
+        <div class="table-wrap" id="top20-wrap"></div>
+      </div>
+    </div>
+
+    <!-- ══ 재고현황 ══ -->
+    <div id="page-inventory" class="page hidden">
+      <div class="page-header">
+        <h2>📦 재고현황 <span class="ro-label">조회 전용</span></h2>
+        <button class="btn btn-outline btn-sm" onclick="Inventory.exportExcel()">📥 Excel 다운로드</button>
+      </div>
+      <div class="card search-card">
+        <div class="filter-grid">
+          <div><label>기준일</label><select id="inv-ref" class="select-full" onchange="Inventory.search()"><option value="">최신</option></select></div>
+          <div><label>공장</label><select id="inv-fac" class="select-full" onchange="Inventory.search()"><option value="">전체</option><option>임실공장</option><option>수원공장</option></select></div>
+          <div><label>품목구분</label><select id="inv-type" class="select-full" onchange="Inventory.search()"><option value="">전체</option><option>제품</option><option>원자재</option><option>반제품</option><option>재공품</option></select></div>
+          <div><label>품목코드</label><input id="inv-code" class="input-full" placeholder="검색" oninput="Inventory.debounce()"></div>
+          <div><label>LOT NO</label><input id="inv-lot" class="input-full" placeholder="검색" oninput="Inventory.debounce()"></div>
+          <div><label>품명</label><input id="inv-iname" class="input-full" placeholder="검색" oninput="Inventory.debounce()"></div>
+          <div><label>원가중심점</label><input id="inv-cc" class="input-full" placeholder="조직명 검색" oninput="Inventory.debounce()"></div>
+          <div><label>담당부서</label><select id="inv-dept" class="select-full" onchange="Inventory.search()"><option value="">전체</option><option>영업</option><option>생산</option><option>구매</option></select></div>
+          <div style="display:flex;align-items:flex-end;gap:6px">
+            <button class="btn btn-primary btn-sm" onclick="Inventory.search()">검색</button>
+            <button class="btn btn-outline btn-sm" onclick="Inventory.reset()">초기화</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div id="inv-info" class="table-info"></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>공장</th><th>품목구분</th><th>품목코드</th><th>품명</th><th>원가중심점</th>
+              <th>LOT NO</th><th>중량</th><th>금액</th><th>소진금액</th>
+              <th>기준일자</th><th>개월</th><th>신규/기존</th>
+              <th>담당부서</th><th>장기재고사유</th><th>소진계획방안</th><th>소진계획기한</th><th>세부계획</th><th>실적</th>
+            </tr></thead>
+            <tbody id="inv-tbody"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="inv-page"></div>
+      </div>
+    </div>
+
+    <!-- ══ 소진계획 입력 ══ -->
+    <div id="page-plans" class="page hidden">
+      <div class="page-header">
+        <h2>✏️ 소진계획 입력</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline btn-sm" onclick="Plans.downloadTemplate()">📥 템플릿 다운로드</button>
+          <label class="btn btn-outline btn-sm" style="cursor:pointer">
+            📤 엑셀 일괄업로드<input type="file" id="plan-excel-file" accept=".xlsx" style="display:none" onchange="Plans.excelUpload(this)">
+          </label>
+        </div>
+      </div>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="Plans.switchTab('noplan')">📋 미등록 재고 <span id="noplan-cnt" class="cnt-badge"></span></button>
+        <button class="tab-btn" onclick="Plans.switchTab('registered')">✅ 등록 완료</button>
+        <button class="tab-btn" onclick="Plans.switchTab('bulk')">📋 일괄 입력</button>
+      </div>
+
+      <!-- 미등록 탭 -->
+      <div id="tab-noplan" class="tab-content">
+        <div class="card search-card">
+          <div class="filter-grid">
+            <div><label>기준일</label><select id="noplan-ref" class="select-full" onchange="Plans.loadNoPlan()"><option value="">최신</option></select></div>
+            <div><label>공장</label><select id="noplan-fac" class="select-full" onchange="Plans.loadNoPlan()"><option value="">전체</option><option>임실공장</option><option>수원공장</option></select></div>
+            <div><label>품명</label><input id="noplan-iname" class="input-full" placeholder="검색" oninput="Plans.noplanDebounce()"></div>
+            <div><label>원가중심점</label><input id="noplan-cc" class="input-full" placeholder="조직명 검색" oninput="Plans.noplanDebounce()"></div>
+            <div><label>LOT NO</label><input id="noplan-lot" class="input-full" placeholder="검색" oninput="Plans.noplanDebounce()"></div>
+            <div style="display:flex;align-items:flex-end"><button class="btn btn-primary btn-sm" onclick="Plans.loadNoPlan()">검색</button></div>
+          </div>
+        </div>
+        <div class="card">
+          <div id="noplan-info" class="table-info"></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>공장</th><th>품목구분</th><th>품목코드</th><th>품명</th><th>원가중심점</th><th>LOT NO</th><th>중량</th><th>금액</th><th>기준일자</th><th>신규/기존</th><th>입력</th></tr></thead>
+              <tbody id="noplan-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="noplan-page"></div>
+        </div>
+      </div>
+
+      <!-- 등록완료 탭 -->
+      <div id="tab-registered" class="tab-content hidden">
+        <div class="card search-card">
+          <div class="filter-grid">
+            <div><label>기준일</label><select id="plan-ref" class="select-full" onchange="Plans.loadRegistered()"><option value="">최신</option></select></div>
+            <div><label>공장</label><select id="plan-fac" class="select-full" onchange="Plans.loadRegistered()"><option value="">전체</option><option>임실공장</option><option>수원공장</option></select></div>
+            <div><label>담당부서</label><select id="plan-dept" class="select-full" onchange="Plans.loadRegistered()"><option value="">전체</option><option>영업</option><option>생산</option><option>구매</option></select></div>
+            <div><label>소진계획방안</label><select id="plan-type" class="select-full" onchange="Plans.loadRegistered()"><option value="">전체</option><option>생산투입</option><option>전환 판매</option><option>폐기</option><option>기타</option></select></div>
+            <div><label>LOT NO</label><input id="plan-lot" class="input-full" placeholder="검색" oninput="Plans.regDebounce()"></div>
+            <div><label>원가중심점</label><input id="plan-cc" class="input-full" placeholder="조직명 검색" oninput="Plans.regDebounce()"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div id="plan-info" class="table-info"></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>공장</th><th>품목구분</th><th>품목코드</th><th>품명</th><th>원가중심점</th><th>LOT NO</th><th>중량</th><th>금액</th><th>기준일자</th><th>담당부서</th><th>장기재고사유</th><th>소진계획방안</th><th>소진계획기한</th><th>세부계획</th><th>작성자</th><th>작성일시</th><th>수정자</th><th>수정일시</th><th>수정/삭제</th></tr></thead>
+              <tbody id="plan-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="plan-page"></div>
+        </div>
+      </div>
+
+      <!-- 일괄입력 탭 -->
+      <div id="tab-bulk" class="tab-content hidden">
+        <div class="card">
+          <div class="card-title">📋 일괄 입력 — LOT NO 여러 건에 동일 계획 적용</div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="form-2col">
+              <div class="form-group"><label>담당부서 <span class="req">*</span></label>
+                <select id="bulk-dept" class="select-full"><option value="">선택</option><option>영업</option><option>생산</option><option>구매</option></select></div>
+              <div class="form-group"><label>장기재고사유 <span class="req">*</span></label>
+                <select id="bulk-reason" class="select-full"><option value="">선택</option><option>주문 변경</option><option>주문 취소</option><option>납품 후 잔량</option><option>기타</option></select></div>
+              <div class="form-group"><label>소진계획방안 <span class="req">*</span></label>
+                <select id="bulk-ptype" class="select-full"><option value="">선택</option><option>생산투입</option><option>전환 판매</option><option>폐기</option><option>기타</option></select></div>
+              <div class="form-group"><label>소진계획기한 <span class="req">*</span></label>
+                <input id="bulk-date" type="date" class="input-full"></div>
+            </div>
+            <div class="form-group"><label>세부계획</label>
+              <textarea id="bulk-detail" class="textarea-full" rows="2" placeholder="공통 세부계획 (선택)"></textarea></div>
+            <div class="form-group">
+              <label>LOT NO 목록 <span class="req">*</span> <small style="color:#888;font-weight:400">한 줄에 하나씩, 또는 아래 목록에서 체크박스 선택</small></label>
+              <textarea id="bulk-lots" class="textarea-full" rows="5" placeholder="ST2502000001&#10;ST2502000002&#10;ST2502000003"></textarea>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px">
+              <button class="btn btn-outline" onclick="Plans.bulkClear()">초기화</button>
+              <button class="btn btn-primary" onclick="Plans.bulkSave()">💾 일괄 저장</button>
+            </div>
+            <div id="bulk-result" class="hidden"></div>
+          </div>
+        </div>
+        <!-- 일괄입력용 재고목록 -->
+        <div class="card">
+          <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+            <span>📦 재고 목록에서 LOT NO 선택</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <select id="bulk-inv-ref" class="select-sm" onchange="Plans.loadBulkInventory()"><option value="">최신</option></select>
+              <input id="bulk-inv-lot" class="input-sm" placeholder="LOT NO 검색" oninput="Plans.bulkInvDebounce()">
+              <input id="bulk-inv-cc" class="input-sm" placeholder="원가중심점" oninput="Plans.bulkInvDebounce()">
+              <input id="bulk-inv-iname" class="input-sm" placeholder="품명" oninput="Plans.bulkInvDebounce()">
+              <button class="btn btn-xs btn-outline" onclick="Plans.selectAllBulk()">전체선택</button>
+              <button class="btn btn-xs btn-outline" onclick="Plans.clearBulkSelect()">선택해제</button>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:380px">
+            <table class="data-table">
+              <thead><tr><th style="width:36px">☑</th><th>공장</th><th>품목코드</th><th>품명</th><th>원가중심점</th><th>LOT NO</th><th>중량</th><th>금액</th><th>기준일자</th></tr></thead>
+              <tbody id="bulk-inv-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="bulk-inv-page"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 계획/실적 비교 ══ -->
+    <div id="page-compare" class="page hidden">
+      <div class="page-header">
+        <h2>📈 계획/실적 비교</h2>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-outline btn-sm" onclick="Compare.exportExcel()">📥 Excel 다운로드</button>
+          <button class="btn btn-outline btn-sm" onclick="Compare.exportPpt()">📊 PPT 다운로드</button>
+        </div>
+      </div>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="Compare.switchTab('summary')">📊 요약 대시보드</button>
+        <button class="tab-btn" onclick="Compare.switchTab('list')">📋 상세 목록</button>
+      </div>
+      <div class="card search-card">
+        <div class="filter-grid">
+          <div><label>기준일</label><select id="cmp-ref" class="select-full" onchange="Compare.search()"><option value="">최신</option></select></div>
+          <div><label>공장</label><select id="cmp-fac" class="select-full" onchange="Compare.search()"><option value="">전체</option><option>임실공장</option><option>수원공장</option></select></div>
+          <div><label>담당부서</label><select id="cmp-dept" class="select-full" onchange="Compare.search()"><option value="">전체</option><option>영업</option><option>생산</option><option>구매</option></select></div>
+          <div style="display:flex;align-items:flex-end"><button class="btn btn-primary btn-sm" onclick="Compare.search()">검색</button></div>
+        </div>
+      </div>
+      <div id="tab-cmp-summary" class="tab-content">
+        <div id="cmp-kpi" class="kpi-grid"></div>
+        <div class="grid-2">
+          <div class="card"><div class="card-title">📊 유형별 계획 vs 실적 건수</div><canvas id="chart-cmp-count" height="250"></canvas></div>
+          <div class="card"><div class="card-title">⚖️ 유형별 계획 vs 실적 중량</div><canvas id="chart-cmp-wt" height="250"></canvas></div>
+        </div>
+        <div class="card"><div class="card-title">📅 월별 소진계획 현황</div><canvas id="chart-plan-monthly" height="180"></canvas></div>
+      </div>
+      <div id="tab-cmp-list" class="tab-content hidden">
+        <div class="card">
+          <div id="cmp-info" class="table-info"></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr>
+                <th>공장</th><th>품목구분</th><th>품목코드</th><th>품명</th><th>원가중심점</th>
+                <th>LOT NO</th><th>중량</th><th>금액</th><th>소진금액</th>
+                <th>기준일자</th><th>담당부서</th><th>계획유형</th><th>소진계획기한</th>
+                <th>실적유형</th><th>처리일자</th><th>유형일치</th><th>조치여부</th><th>실적수정</th>
+              </tr></thead>
+              <tbody id="cmp-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="cmp-page"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 파일 업로드 ══ -->
+    <div id="page-upload" class="page hidden">
+      <div class="page-header"><h2>📤 파일 업로드</h2></div>
+      <div class="card" style="max-width:700px">
+        <div class="card-title">장기재고현황 Excel 업로드</div>
+        <div class="upload-note">
+          📌 <b>업로드 파일 구조</b><br>
+          ① <b>장기재고현황_재고</b> — N열: 중량(kg), O열: 금액, R열: 장기구분(<b>신규/기존</b>만 적재)<br>
+          ② <b>장기재고현황_재공</b> — N열: 중량(kg), O열: 금액, R열: 장기구분(<b>신규/기존</b>만 적재)<br>
+          ③ 장기재고현황_재고_상세 (소진실적, 선택) ④ 장기재고현황_재공_상세 (선택)<br>
+          📐 중량은 <b>kg 단위</b> → 시스템 내 <b>ton 자동 변환</b> | 전월 대비 감소분 → <b>소진금액 자동 계산</b>
+        </div>
+        <div class="upload-zone" ondragover="event.preventDefault()" ondrop="Upload.drop(event)" onclick="document.getElementById('up-file').click()">
+          <div style="font-size:48px;margin-bottom:12px">📁</div>
+          <p style="font-size:15px;font-weight:600">클릭 또는 파일 드래그</p>
+          <p style="font-size:12px;color:#888;margin-top:6px">.xlsx 파일만 지원</p>
+          <input type="file" id="up-file" accept=".xlsx" style="display:none" onchange="Upload.upload(this)">
+        </div>
+        <div id="up-result" class="hidden"></div>
+      </div>
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+          <span>📅 업로드 이력</span>
+          <button class="btn btn-danger btn-sm" onclick="Upload.deleteAll()">🗑️ 전체 삭제</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>파일명</th><th>기준일</th><th>재고건수</th><th>재공건수</th><th>실적건수</th><th>총금액</th><th>업로드자</th><th>일시</th><th>삭제</th></tr></thead>
+            <tbody id="hist-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+    <!-- ══ 사용자 관리 ══ -->
+    <div id="page-users" class="page hidden">
+      <div class="page-header">
+        <h2>👥 사용자 관리</h2>
+        <button class="btn btn-primary btn-sm" onclick="Users.openCreateModal()">+ 사용자 추가</button>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>ID</th><th>아이디</th><th>이름</th><th>권한</th>
+              <th>부서</th><th>활성</th><th>최근로그인</th><th>관리</th>
+            </tr></thead>
+            <tbody id="users-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 소진계획 모달 -->
+<div id="modal" class="modal-bg hidden">
+  <div class="modal-box">
+    <div class="modal-head"><h3>소진계획 입력</h3><button onclick="Modal.close()">✕</button></div>
+    <div class="modal-body">
+      <div id="modal-info" class="modal-info"></div>
+      <div class="form-2col">
+        <div class="form-group"><label>담당부서 <span class="req">*</span></label>
+          <select id="f-dept" class="select-full"><option value="">선택</option><option>영업</option><option>생산</option><option>구매</option></select></div>
+        <div class="form-group"><label>장기재고사유 <span class="req">*</span></label>
+          <select id="f-reason" class="select-full"><option value="">선택</option><option>주문 변경</option><option>주문 취소</option><option>납품 후 잔량</option><option>기타</option></select></div>
+        <div class="form-group"><label>소진계획방안 <span class="req">*</span></label>
+          <select id="f-ptype" class="select-full"><option value="">선택</option><option>생산투입</option><option>전환 판매</option><option>폐기</option><option>기타</option></select></div>
+        <div class="form-group"><label>소진계획기한 <span class="req">*</span></label>
+          <input id="f-date" type="date" class="input-full"></div>
+      </div>
+      <div class="form-group"><label>세부계획</label>
+        <textarea id="f-detail" class="textarea-full" rows="3" placeholder="세부 소진 계획 입력"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-outline" onclick="Modal.close()">취소</button>
+      <button class="btn btn-primary" onclick="Modal.save()">💾 저장</button>
+    </div>
+  </div>
+</div>
+
+<!-- 실적유형 수정 모달 -->
+<div id="amodal" class="modal-bg hidden">
+  <div class="modal-box" style="max-width:360px">
+    <div class="modal-head"><h3>소진실적 유형 수정</h3><button onclick="AModal.close()">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label>실적유형 <span class="req">*</span></label>
+        <select id="af-type" class="select-full"><option>생산투입</option><option>전환 판매</option><option>폐기</option><option>기타</option></select></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-outline" onclick="AModal.close()">취소</button>
+      <button class="btn btn-primary" onclick="AModal.save()">저장</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- 사용자 생성/수정 모달 -->
+<div id="umodal" class="modal-bg hidden">
+  <div class="modal-box" style="max-width:480px">
+    <div class="modal-head"><h3 id="umodal-title">사용자 추가</h3><button onclick="Users.closeModal()">✕</button></div>
+    <div class="modal-body">
+      <input type="hidden" id="u-id">
+      <div class="form-2col">
+        <div class="form-group"><label>아이디 <span class="req">*</span></label>
+          <input id="u-username" class="input-full" placeholder="영문+숫자"></div>
+        <div class="form-group"><label>이름 <span class="req">*</span></label>
+          <input id="u-dname" class="input-full" placeholder="홍길동"></div>
+        <div class="form-group"><label>비밀번호 <span class="req" id="u-pw-req">*</span></label>
+          <input id="u-pw" type="password" class="input-full" placeholder="수정 시 비워두면 변경 안함"></div>
+        <div class="form-group"><label>권한 <span class="req">*</span></label>
+          <select id="u-role" class="select-full">
+            <option value="user">일반사용자</option>
+            <option value="admin">관리자</option>
+          </select></div>
+        <div class="form-group"><label>부서</label>
+          <input id="u-dept" class="input-full" placeholder="부서명"></div>
+        <div class="form-group"><label>활성 상태</label>
+          <select id="u-active" class="select-full">
+            <option value="1">활성</option><option value="0">비활성</option>
+          </select></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-outline" onclick="Users.closeModal()">취소</button>
+      <button class="btn btn-primary" onclick="Users.save()">저장</button>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="/static/js/app.js"></script>
+
+<script>
+// ── 날짜 입력 마스킹 (yyyy-mm-dd 자동 커서 이동)
+function initDateMask(inputId) {
+  const inp = document.getElementById(inputId);
+  if (!inp) return;
+  inp.setAttribute('placeholder', 'YYYY-MM-DD');
+  inp.setAttribute('maxlength', '10');
+
+  inp.addEventListener('keydown', function(e) {
+    const allowed = ['Backspace','Delete','Tab','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'];
+    if (allowed.includes(e.key)) return;
+    if (!/[0-9]/.test(e.key)) { e.preventDefault(); return; }
+  });
+
+  inp.addEventListener('input', function(e) {
+    let v = this.value.replace(/[^0-9]/g,'');
+    let formatted = '';
+    if (v.length >= 5) {
+      formatted = v.slice(0,4) + '-' + v.slice(4);
+      if (v.length >= 7) formatted = v.slice(0,4) + '-' + v.slice(4,6) + '-' + v.slice(6,8);
+    } else {
+      formatted = v;
+    }
+    this.value = formatted.slice(0,10);
+    // 자동 커서 이동: 4자리 입력 → '-' 추가 후 다음 위치
+    const pos = this.value.length;
+    if (pos === 5 || pos === 8) {
+      setTimeout(()=>{ this.setSelectionRange(pos, pos); }, 0);
+    }
+  });
+
+  inp.addEventListener('blur', function() {
+    const v = this.value;
+    if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+      this.style.borderColor = '#dc2626';
+      this.title = 'YYYY-MM-DD 형식으로 입력하세요';
+    } else {
+      this.style.borderColor = '';
+      this.title = '';
+    }
+  });
+}
+
+// 페이지 로드 후 날짜 필드에 마스킹 적용
+document.addEventListener('DOMContentLoaded', function() {
+  // 모달 날짜 필드
+  initDateMask('f-date');
+  initDateMask('bulk-date');
+});
+</script>
+
+</body>
+</html>

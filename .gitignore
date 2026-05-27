@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+venv/
+env/
+.venv/
+
+# 데이터 (로컬 DB - 클라우드에선 볼륨 사용)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# 업로드 파일 (임시)
+uploads/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
