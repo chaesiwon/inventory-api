@@ -10,7 +10,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: FRONTEND_URL
-        value: https://your-app.vercel.app
+        value: https://inventory-pwa-81en.vercel.app
       - key: PYTHON_VERSION
         value: 3.11.0
     disk:

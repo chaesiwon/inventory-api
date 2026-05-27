@@ -587,28 +587,54 @@ async def export_inventory(
 # ══════════════════════════════════════
 @router.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
-    u = require_role(request, "admin")
+    # 인증 확인 (상세 로그)
+    user_id_h  = request.headers.get("X-User-Id", "")
+    user_tok_h = request.headers.get("X-Auth-Token", "")
+    logger.info(f"[upload] 요청 수신 - X-User-Id={user_id_h!r} tok_len={len(user_tok_h)}")
+
+    u = cur_user(request)
+    if not u:
+        logger.warning(f"[upload] 인증 실패 - user_id={user_id_h!r}")
+        raise HTTPException(401, "로그인이 필요합니다. 새로고침 후 다시 로그인하세요.")
+
+    logger.info(f"[upload] 인증 성공 - user={u['username']}, file={file.filename}")
+
     if not file.filename.endswith(".xlsx"):
         raise HTTPException(400, ".xlsx 파일만 업로드 가능합니다.")
+
     try:
-        content = await file.read()
-        if len(content) == 0:
+        raw = await file.read()
+        logger.info(f"[upload] 파일 읽기 완료 - size={len(raw):,} bytes")
+
+        if len(raw) == 0:
             raise HTTPException(400, "빈 파일입니다.")
-        parsed = parse_inventory_file(content, file.filename, u["username"])
+
+        parsed = parse_inventory_file(raw, file.filename, u["username"])
         if "error" in parsed:
+            logger.error(f"[upload] 파싱 오류: {parsed['error']}")
             raise HTTPException(400, parsed["error"])
+
+        logger.info(f"[upload] 파싱 성공 - 재고:{len([i for i in parsed['inventory'] if i.get('source_sheet')=='재고'])}건 재공:{len([i for i in parsed['inventory'] if i.get('source_sheet')=='재공'])}건")
+
         result = save_parsed_data(parsed, u["username"])
+        logger.info(f"[upload] 저장 완료 - {result}")
+
         return {
-            "ok": True, "upload_id": result["upload_id"],
-            "ref_date": parsed["ref_date"],
-            "inv_count": result["inv_count"], "wip_count": result["wip_count"],
-            "act_count": result["act_count"], "total_amount": result["total_amount"],
-            "warnings": parsed.get("warnings", []),
+            "ok": True,
+            "upload_id":    result["upload_id"],
+            "ref_date":     parsed["ref_date"],
+            "inv_count":    result["inv_count"],
+            "wip_count":    result["wip_count"],
+            "act_count":    result["act_count"],
+            "total_amount": result["total_amount"],
+            "warnings":     parsed.get("warnings", []),
         }
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"파일 업로드 오류: {e}", exc_info=True)
-        raise HTTPException(500, f"업로드 처리 실패: {e}")
+        import traceback
+        logger.error("[upload] 처리 실패: " + traceback.format_exc())
+        raise HTTPException(500, f"업로드 처리 실패: {str(e)}")
 
 @router.get("/upload-history")
 async def upload_history():
@@ -617,6 +643,7 @@ async def upload_history():
         rows = conn.execute("SELECT * FROM upload_history ORDER BY created_at DESC LIMIT 50").fetchall()
         return {"history": [dict(r) for r in rows]}
     finally: conn.close()
+
 
 @router.delete("/upload/all/data")
 async def delete_all(request: Request):
