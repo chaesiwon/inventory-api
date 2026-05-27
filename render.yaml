@@ -2,15 +2,17 @@ services:
   - type: web
     name: inventory-api
     env: python
-    region: singapore          # 한국에서 가장 가까운 리전
+    region: singapore
     plan: free
-    buildCommand: pip install -r requirements.txt && python migrate.py
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r requirements.txt
+    startCommand: python migrate.py && uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: SECRET_KEY
         generateValue: true
       - key: FRONTEND_URL
-        value: https://your-app.vercel.app   # ← Vercel 배포 후 실제 URL로 변경
+        value: https://your-app.vercel.app
+      - key: PYTHON_VERSION
+        value: 3.11.0
     disk:
       name: inventory-data
       mountPath: /opt/render/project/src/data

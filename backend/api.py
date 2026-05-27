@@ -618,6 +618,24 @@ async def upload_history():
         return {"history": [dict(r) for r in rows]}
     finally: conn.close()
 
+@router.delete("/upload/all/data")
+async def delete_all(request: Request):
+    require_role(request, "admin")
+    conn = get_conn()
+    try:
+        for t in ["inventory_items","depletion_actuals","upload_history"]:
+            conn.execute(f"DELETE FROM {t}")
+        conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"전체 삭제 오류: {e}", exc_info=True)
+        raise HTTPException(500, f"전체 삭제 실패: {e}")
+    finally: conn.close()
+
+# ══════════════════════════════════════
+# 소진계획: 경로 충돌 주의 - 구체적 경로를 먼저 등록
+# ══════════════════════════════════════
 @router.delete("/upload/{upload_id}")
 async def delete_upload(upload_id: str, request: Request):
     require_role(request, "admin")
@@ -638,24 +656,6 @@ async def delete_upload(upload_id: str, request: Request):
         raise HTTPException(500, f"삭제 실패: {e}")
     finally: conn.close()
 
-@router.delete("/upload/all/data")
-async def delete_all(request: Request):
-    require_role(request, "admin")
-    conn = get_conn()
-    try:
-        for t in ["inventory_items","depletion_actuals","upload_history"]:
-            conn.execute(f"DELETE FROM {t}")
-        conn.commit()
-        return {"ok": True}
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"전체 삭제 오류: {e}", exc_info=True)
-        raise HTTPException(500, f"전체 삭제 실패: {e}")
-    finally: conn.close()
-
-# ══════════════════════════════════════
-# 소진계획: 경로 충돌 주의 - 구체적 경로를 먼저 등록
-# ══════════════════════════════════════
 @router.get("/plans/export-template")
 async def export_plan_template(ref_date: Optional[str] = Query(None)):
     """소진계획 템플릿 다운로드 - 한글 파일명 RFC 5987 처리"""
