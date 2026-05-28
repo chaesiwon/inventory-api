@@ -293,14 +293,39 @@ async def dashboard_kpi(ref_date: Optional[str] = Query(None)):
                     "new_amount":0,"completed_amount":0,"uncompleted_amount":0,
                     "no_plan_amount":0,"plan_this_month":0,"total_consumed_amount":0}
 
+        # 기본 집계
         r = conn.execute("""
             SELECT COALESCE(SUM(amount),0) AS ta, COALESCE(SUM(weight_ton),0) AS tw,
                    COUNT(*) AS tc,
-                   COALESCE(SUM(CASE WHEN is_new=1 THEN amount ELSE 0 END),0) AS na,
-                   COALESCE(SUM(amount_consumed),0) AS tca
+                   COALESCE(SUM(CASE WHEN is_new=1 THEN amount ELSE 0 END),0) AS na
             FROM inventory_items WHERE ref_date=?
         """, (ref_date,)).fetchone()
 
+        # 소진금액: 전월 대비 실제 재고 감소분
+        # = 전월에 존재했던 LOT 중 당월에 사라졌거나 금액이 감소한 것의 합
+        prev_rd = _prev_ref(conn, ref_date, "month")
+        consumed_amount = 0.0
+        if prev_rd:
+            # 전월에 있고 당월에 없어진 LOT 금액
+            disappeared = conn.execute("""
+                SELECT COALESCE(SUM(prev.amount), 0)
+                FROM inventory_items prev
+                WHERE prev.ref_date=?
+                  AND NOT EXISTS(
+                    SELECT 1 FROM inventory_items cur
+                    WHERE cur.lot_no=prev.lot_no AND cur.ref_date=?
+                  )
+            """, (prev_rd, ref_date)).fetchone()[0]
+            # 전월보다 금액이 줄어든 LOT의 감소분
+            decreased = conn.execute("""
+                SELECT COALESCE(SUM(prev.amount - cur.amount), 0)
+                FROM inventory_items prev
+                JOIN inventory_items cur ON cur.lot_no=prev.lot_no AND cur.ref_date=?
+                WHERE prev.ref_date=? AND prev.amount > cur.amount
+            """, (ref_date, prev_rd)).fetchone()[0]
+            consumed_amount = float(disappeared) + float(decreased)
+
+        # 소진 완료 (계획O + 실적O)
         completed = conn.execute("""
             SELECT COALESCE(SUM(i.amount),0) FROM inventory_items i
             WHERE i.ref_date=?
@@ -308,6 +333,7 @@ async def dashboard_kpi(ref_date: Optional[str] = Query(None)):
               AND EXISTS(SELECT 1 FROM depletion_actuals a WHERE a.lot_no=i.lot_no)
         """, (ref_date,)).fetchone()[0]
 
+        # 미조치 (계획O + 실적X + 현재 재고에 존재)
         uncompleted = conn.execute("""
             SELECT COALESCE(SUM(i.amount),0) FROM inventory_items i
             WHERE i.ref_date=?
@@ -315,20 +341,23 @@ async def dashboard_kpi(ref_date: Optional[str] = Query(None)):
               AND NOT EXISTS(SELECT 1 FROM depletion_actuals a WHERE a.lot_no=i.lot_no)
         """, (ref_date,)).fetchone()[0]
 
+        # 계획 미등록
         no_plan = conn.execute("""
             SELECT COALESCE(SUM(i.amount),0) FROM inventory_items i
-            WHERE i.ref_date=? AND NOT EXISTS(SELECT 1 FROM depletion_plans p WHERE p.lot_no=i.lot_no)
+            WHERE i.ref_date=?
+              AND NOT EXISTS(SELECT 1 FROM depletion_plans p WHERE p.lot_no=i.lot_no)
         """, (ref_date,)).fetchone()[0]
 
+        # 당월 소진 예정 (계획기한이 당월인 LOT 금액)
         this_month = date.today().strftime("%Y-%m")
         plan_this = conn.execute("""
             SELECT COALESCE(SUM(i.amount),0) FROM inventory_items i
             JOIN depletion_plans p ON p.lot_no=i.lot_no
-            WHERE i.ref_date=? AND p.plan_date LIKE ?
-        """, (ref_date, f"{this_month}%")).fetchone()[0]
+            WHERE i.ref_date=? AND substr(p.plan_date,1,7)=?
+        """, (ref_date, this_month)).fetchone()[0]
 
         return {
-            "ref_date": ref_date,
+            "ref_date":              ref_date,
             "total_amount":          float(r["ta"]),
             "total_weight_ton":      float(r["tw"]),
             "total_count":           int(r["tc"]),
@@ -337,7 +366,7 @@ async def dashboard_kpi(ref_date: Optional[str] = Query(None)):
             "uncompleted_amount":    float(uncompleted),
             "no_plan_amount":        float(no_plan),
             "plan_this_month":       float(plan_this),
-            "total_consumed_amount": float(r["tca"]),
+            "total_consumed_amount": consumed_amount,
         }
     except Exception as e:
         logger.error(f"KPI 조회 오류: {e}", exc_info=True)
@@ -433,37 +462,68 @@ async def period_compare(
         if not ref_date: ref_date = _latest_ref(conn)
         prev_rd = _prev_ref(conn, ref_date, mode)
 
-        def _summary(rd):
+        def _snapshot_consumed(cur_rd, prev_rd_):
+            """전기 대비 실제 소진금액 = 사라진 LOT 금액 + 감소한 LOT 금액"""
+            if not prev_rd_: return 0.0
+            disappeared = conn.execute("""
+                SELECT COALESCE(SUM(prev.amount),0)
+                FROM inventory_items prev
+                WHERE prev.ref_date=?
+                  AND NOT EXISTS(SELECT 1 FROM inventory_items cur
+                                 WHERE cur.lot_no=prev.lot_no AND cur.ref_date=?)
+            """, (prev_rd_, cur_rd)).fetchone()[0]
+            decreased = conn.execute("""
+                SELECT COALESCE(SUM(prev.amount - cur.amount),0)
+                FROM inventory_items prev
+                JOIN inventory_items cur ON cur.lot_no=prev.lot_no AND cur.ref_date=?
+                WHERE prev.ref_date=? AND prev.amount > cur.amount
+            """, (cur_rd, prev_rd_)).fetchone()[0]
+            return float(disappeared) + float(decreased)
+
+        def _summary(rd, base_rd=None):
             if not rd: return None
             r = conn.execute("""
-                SELECT COALESCE(SUM(amount),0) AS ta, COALESCE(SUM(weight_ton),0) AS tw,
-                       COUNT(*) AS tc, COALESCE(SUM(amount_consumed),0) AS tca
+                SELECT COALESCE(SUM(amount),0) AS ta,
+                       COALESCE(SUM(weight_ton),0) AS tw,
+                       COUNT(*) AS tc
                 FROM inventory_items WHERE ref_date=?
             """, (rd,)).fetchone()
             ar = conn.execute("""
                 SELECT COUNT(DISTINCT i.lot_no) AS plan_total,
                        SUM(CASE WHEN a.lot_no IS NOT NULL THEN 1 ELSE 0 END) AS action_cnt,
                        COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.amount ELSE 0 END),0) AS action_amt,
-                       COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.weight_ton ELSE 0 END),0) AS action_wt
+                       COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.weight_ton ELSE 0 END),0) AS action_wt,
+                       COALESCE(SUM(CASE WHEN a.lot_no IS NULL THEN i.amount ELSE 0 END),0) AS no_act_amt
                 FROM inventory_items i
                 JOIN depletion_plans p ON p.lot_no=i.lot_no
                 LEFT JOIN depletion_actuals a ON a.lot_no=i.lot_no
                 WHERE i.ref_date=?
             """, (rd,)).fetchone()
+            # 해당 기간의 소진금액: 해당 기준일의 이전 기준일 대비 계산
+            prev_of_rd = _prev_ref(conn, rd, "month")
+            consumed = _snapshot_consumed(rd, prev_of_rd)
             return {
-                "ref_date": rd, "total_amount": float(r["ta"]),
-                "total_weight": float(r["tw"]), "total_count": int(r["tc"]),
-                "consumed_amount": float(r["tca"]),
-                "plan_total": int(ar["plan_total"]),
-                "action_count": int(ar["action_cnt"]),
-                "action_amount": float(ar["action_amt"]),
-                "action_weight": float(ar["action_wt"]),
+                "ref_date": rd,
+                "total_amount":   float(r["ta"]),
+                "total_weight":   float(r["tw"]),
+                "total_count":    int(r["tc"]),
+                "consumed_amount": consumed,
+                "plan_total":     int(ar["plan_total"]),
+                "action_count":   int(ar["action_cnt"]),
+                "action_amount":  float(ar["action_amt"]),
+                "action_weight":  float(ar["action_wt"]),
+                "no_action_amount": float(ar["no_act_amt"]),
             }
 
         return {
-            "mode": mode, "current": _summary(ref_date), "previous": _summary(prev_rd),
-            "mode_label": {"month":"전월","quarter":"전분기","year":"전년도"}.get(mode,"전월")
+            "mode":       mode,
+            "current":    _summary(ref_date),
+            "previous":   _summary(prev_rd),
+            "mode_label": {"month":"전월","quarter":"전분기","year":"전년도"}.get(mode,"전월"),
         }
+    except Exception as e:
+        logger.error(f"period_compare 오류: {e}", exc_info=True)
+        raise HTTPException(500, f"비교 조회 실패: {e}")
     finally: conn.close()
 
 # ══════════════════════════════════════
@@ -997,51 +1057,109 @@ async def compare_plan_actual(
     finally: conn.close()
 
 @router.get("/compare/summary")
-async def compare_summary(ref_date: Optional[str]=Query(None)):
+async def compare_summary(
+    ref_date: Optional[str]=Query(None),
+    factory:  Optional[str]=Query(None),
+    dept:     Optional[str]=Query(None),
+):
     conn = get_conn()
     try:
         if not ref_date: ref_date = _latest_ref(conn)
-        r=conn.execute("""
+
+        # 공장/부서 필터 조건
+        conds = ["i.ref_date=?"]
+        params: list = [ref_date]
+        if factory: conds.append("i.factory=?"); params.append(factory)
+        if dept:    conds.append("p.dept=?"); params.append(dept)
+        where = " AND ".join(conds)
+
+        r = conn.execute(f"""
             SELECT COUNT(*) AS plan_total,
                    SUM(CASE WHEN a.lot_no IS NOT NULL THEN 1 ELSE 0 END) AS action_count,
-                   SUM(CASE WHEN a.lot_no IS NULL THEN 1 ELSE 0 END) AS no_action_count,
+                   SUM(CASE WHEN a.lot_no IS NULL     THEN 1 ELSE 0 END) AS no_action_count,
                    COALESCE(SUM(i.weight_ton),0) AS total_weight,
-                   COALESCE(SUM(i.amount),0) AS total_amount,
+                   COALESCE(SUM(i.amount),0)     AS total_amount,
                    COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.weight_ton ELSE 0 END),0) AS action_weight,
-                   COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.amount ELSE 0 END),0) AS action_amount,
-                   COALESCE(SUM(CASE WHEN a.lot_no IS NULL THEN i.weight_ton ELSE 0 END),0) AS no_action_weight,
-                   COALESCE(SUM(CASE WHEN a.lot_no IS NULL THEN i.amount ELSE 0 END),0) AS no_action_amount,
-                   COALESCE(SUM(i.amount_consumed),0) AS consumed_amount
+                   COALESCE(SUM(CASE WHEN a.lot_no IS NOT NULL THEN i.amount     ELSE 0 END),0) AS action_amount,
+                   COALESCE(SUM(CASE WHEN a.lot_no IS NULL     THEN i.weight_ton ELSE 0 END),0) AS no_action_weight,
+                   COALESCE(SUM(CASE WHEN a.lot_no IS NULL     THEN i.amount     ELSE 0 END),0) AS no_action_amount
             FROM inventory_items i
             JOIN depletion_plans p ON p.lot_no=i.lot_no
             LEFT JOIN depletion_actuals a ON a.lot_no=i.lot_no
-            WHERE i.ref_date=?
-        """,(ref_date,)).fetchone()
-        pt=r["plan_total"] or 1; ac=r["action_count"] or 0
-        plan_rows=conn.execute("""
+            WHERE {where}
+        """, params).fetchone()
+
+        pt = max(r["plan_total"] or 1, 1)
+        ac = r["action_count"] or 0
+
+        # 달성률 = 중량 기준 (조치 완료된 LOT 중량 / 전체 계획 LOT 중량)
+        tw = float(r["total_weight"]) or 1
+        aw = float(r["action_weight"])
+        achievement_rate_wt = round(aw / tw * 100, 1) if tw > 0 else 0.0
+        # 건수 기준 달성률도 함께 제공
+        achievement_rate_cnt = round(ac / pt * 100, 1)
+
+        # 소진금액: 전월 스냅샷 기준
+        prev_rd = _prev_ref(conn, ref_date, "month")
+        consumed_amount = 0.0
+        if prev_rd:
+            conds2 = ["prev.ref_date=?", "NOT EXISTS(SELECT 1 FROM inventory_items cur WHERE cur.lot_no=prev.lot_no AND cur.ref_date=?)"]
+            params2 = [prev_rd, ref_date]
+            if factory: conds2.append("prev.factory=?"); params2.append(factory)
+            disappeared = conn.execute(
+                f"SELECT COALESCE(SUM(prev.amount),0) FROM inventory_items prev WHERE {' AND '.join(conds2)}",
+                params2
+            ).fetchone()[0]
+            conds3 = ["prev.ref_date=?", "cur.ref_date=?", "prev.amount > cur.amount"]
+            params3 = [prev_rd, ref_date]
+            if factory: conds3.append("prev.factory=?"); params3.append(factory)
+            decreased = conn.execute(
+                f"SELECT COALESCE(SUM(prev.amount - cur.amount),0) FROM inventory_items prev JOIN inventory_items cur ON cur.lot_no=prev.lot_no WHERE {' AND '.join(conds3)}",
+                params3
+            ).fetchone()[0]
+            consumed_amount = float(disappeared) + float(decreased)
+
+        # 유형별 계획
+        plan_params = [ref_date] + (params[1:] if len(params)>1 else [])
+        plan_conds  = ["i.ref_date=?"] + (conds[1:] if len(conds)>1 else [])
+        plan_rows = conn.execute(f"""
             SELECT p.plan_type, COUNT(*) AS plan_count,
                    COALESCE(SUM(i.weight_ton),0) AS plan_weight,
-                   COALESCE(SUM(i.amount),0) AS plan_amount
-            FROM depletion_plans p LEFT JOIN inventory_items i ON i.lot_no=p.lot_no AND i.ref_date=?
+                   COALESCE(SUM(i.amount),0)     AS plan_amount
+            FROM depletion_plans p
+            LEFT JOIN inventory_items i ON i.lot_no=p.lot_no AND i.ref_date=?
+            {"JOIN inventory_items i2 ON i2.lot_no=p.lot_no AND i2.factory=?" if factory else ""}
             GROUP BY p.plan_type ORDER BY plan_amount DESC
-        """,(ref_date,)).fetchall()
-        actual_rows=conn.execute("""
+        """, [ref_date] + ([factory] if factory else [])).fetchall()
+
+        actual_rows = conn.execute("""
             SELECT COALESCE(a.actual_type_manual,a.actual_type,'기타') AS actual_type,
-                   COUNT(*) AS actual_count, COALESCE(SUM(a.weight_ton),0) AS actual_weight
+                   COUNT(*) AS actual_count,
+                   COALESCE(SUM(a.weight_ton),0) AS actual_weight
             FROM depletion_actuals a WHERE a.ref_date=?
             GROUP BY actual_type ORDER BY actual_weight DESC
-        """,(ref_date,)).fetchall()
+        """, (ref_date,)).fetchall()
+
         return {
-            "ref_date":ref_date,"plan_total":int(pt),"action_count":int(ac),
-            "no_action_count":int(r["no_action_count"] or 0),
-            "action_rate":round(ac/pt*100,1),
-            "total_weight":float(r["total_weight"]),"total_amount":float(r["total_amount"]),
-            "action_weight":float(r["action_weight"]),"action_amount":float(r["action_amount"]),
-            "no_action_weight":float(r["no_action_weight"]),"no_action_amount":float(r["no_action_amount"]),
-            "consumed_amount":float(r["consumed_amount"]),
-            "plan_by_type":[dict(x) for x in plan_rows],
-            "actual_by_type":[dict(x) for x in actual_rows],
+            "ref_date":            ref_date,
+            "plan_total":          int(pt),
+            "action_count":        int(ac),
+            "no_action_count":     int(r["no_action_count"] or 0),
+            "action_rate":         achievement_rate_cnt,
+            "action_rate_weight":  achievement_rate_wt,
+            "total_weight":        float(r["total_weight"]),
+            "total_amount":        float(r["total_amount"]),
+            "action_weight":       float(r["action_weight"]),
+            "action_amount":       float(r["action_amount"]),
+            "no_action_weight":    float(r["no_action_weight"]),
+            "no_action_amount":    float(r["no_action_amount"]),
+            "consumed_amount":     consumed_amount,
+            "plan_by_type":        [dict(x) for x in plan_rows],
+            "actual_by_type":      [dict(x) for x in actual_rows],
         }
+    except Exception as e:
+        logger.error(f"compare_summary 오류: {e}", exc_info=True)
+        raise HTTPException(500, f"비교 요약 실패: {e}")
     finally: conn.close()
 
 @router.get("/compare/export")
@@ -1131,17 +1249,7 @@ async def export_compare_ppt(ref_date: Optional[str] = Query(None)):
             LEFT JOIN depletion_actuals a ON a.lot_no=i.lot_no
             WHERE i.ref_date=? ORDER BY i.amount DESC LIMIT 50
         """, (ref_date,)).fetchall()
-        conn.close()
-
-        summary = {
-            "plan_total":int(pt),"action_count":int(ac),"no_action_count":int(summ_rows["nc"] or 0),
-            "action_rate":round(ac/pt*100,1),"total_amount":float(summ_rows["ta"]),
-            "action_amount":float(summ_rows["aa"]),"no_action_amount":float(summ_rows["na"]),
-            "consumed_amount":float(summ_rows["ca"]),
-            "plan_by_type":[dict(r) for r in plan_by],
-            "actual_by_type":[dict(r) for r in actual_by],
-        }
-        # plan_trend / cc_items 추가 조회
+        # plan_trend / cc_items 추가 조회 (conn.close() 전에 모두 수행)
         plan_trend_rows = conn.execute("""
             SELECT substr(p.plan_date,1,7) AS plan_month,
                    COUNT(*) AS plan_count,
@@ -1166,6 +1274,26 @@ async def export_compare_ppt(ref_date: Optional[str] = Query(None)):
             GROUP BY i.cost_center, i.cost_center_name
             ORDER BY total_amount DESC
         """, (ref_date,)).fetchall()
+
+        # 소진금액 스냅샷 기준 계산
+        prev_rd = _prev_ref(conn, ref_date, "month")
+        consumed_snapshot = 0.0
+        if prev_rd:
+            d1 = conn.execute("SELECT COALESCE(SUM(prev.amount),0) FROM inventory_items prev WHERE prev.ref_date=? AND NOT EXISTS(SELECT 1 FROM inventory_items cur WHERE cur.lot_no=prev.lot_no AND cur.ref_date=?)",(prev_rd,ref_date)).fetchone()[0]
+            d2 = conn.execute("SELECT COALESCE(SUM(prev.amount-cur.amount),0) FROM inventory_items prev JOIN inventory_items cur ON cur.lot_no=prev.lot_no AND cur.ref_date=? WHERE prev.ref_date=? AND prev.amount>cur.amount",(ref_date,prev_rd)).fetchone()[0]
+            consumed_snapshot = float(d1)+float(d2)
+
+        # DB 조회 완료 후 conn 닫기
+        conn.close()
+
+        summary = {
+            "plan_total":int(pt),"action_count":int(ac),"no_action_count":int(summ_rows["nc"] or 0),
+            "action_rate":round(ac/pt*100,1),"total_amount":float(summ_rows["ta"]),
+            "action_amount":float(summ_rows["aa"]),"no_action_amount":float(summ_rows["na"]),
+            "consumed_amount":consumed_snapshot,
+            "plan_by_type":[dict(r) for r in plan_by],
+            "actual_by_type":[dict(r) for r in actual_by],
+        }
         from backend.ppt_exporter import generate_compare_ppt
         ppt_bytes = generate_compare_ppt(
             summary, [dict(r) for r in items], ref_date,
@@ -1180,6 +1308,8 @@ async def export_compare_ppt(ref_date: Optional[str] = Query(None)):
     except HTTPException: raise
     except Exception as e:
         logger.error(f"PPT 생성 오류: {e}", exc_info=True)
+        try: conn.close()
+        except: pass
         raise HTTPException(500, f"PPT 생성 실패: {str(e)}")
 
 @router.patch("/actuals/{actual_id}/type")
