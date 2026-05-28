@@ -9,8 +9,6 @@ services:
     envVars:
       - key: SECRET_KEY
         generateValue: true
-      - key: FRONTEND_URL
-        value: https://inventory-pwa-81en.vercel.app
       - key: PYTHON_VERSION
         value: 3.11.0
     disk:
