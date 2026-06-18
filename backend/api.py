@@ -629,6 +629,28 @@ async def dashboard_kpi(
         conn.close()
 
 
+@router.get("/dashboard/critical-stock")
+async def critical_stock_summary(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+    """7개월이상 장기재고(months_label='7개월이상') 집중관리 요약."""
+    conn = get_conn()
+    try:
+        if not ref_date:
+            ref_date = _latest_ref(conn)
+        r = conn.execute(f"""
+            SELECT COALESCE(SUM(amount),0) AS ta, COALESCE(SUM(weight_ton),0) AS tw, COUNT(*) AS tc
+            FROM ({_lot_agg_subquery()}) la
+            WHERE months_label = '7개월이상'
+        """, (ref_date,)).fetchone()
+        return {
+            "ref_date": ref_date,
+            "amount": fmt_amount(r["ta"], unit)["value"],
+            "weight_ton": round(r["tw"], 3),
+            "count": r["tc"],
+        }
+    finally:
+        conn.close()
+
+
 @router.get("/dashboard/top20")
 async def top20(ref_date: Optional[str] = Query(None)):
     conn = get_conn()
@@ -736,6 +758,94 @@ async def cost_center_summary(ref_date: Optional[str] = Query(None), unit: str =
             d["total_weight"] = round(d["total_weight"], 3)
             items.append(d)
         return {"ref_date": ref_date, "unit": unit, "items": items}
+    finally:
+        conn.close()
+
+
+@router.get("/dashboard/cost-center-plan-type-summary")
+async def cost_center_plan_type_summary(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+    """
+    원가중심점 × 소진계획방안(plan_type) 별 교차 집계.
+    각 조합에 대해 계획 기준(건수/중량/금액)과 실적 기준(건수/중량/금액)을 모두 산출.
+    실적 건수/중량/금액은 depletion_actuals(상세시트)를 LOT 단위로 집계 후 매칭.
+    """
+    conn = get_conn()
+    try:
+        if not ref_date:
+            ref_date = _latest_ref(conn)
+
+        # 계획 기준: 원가중심점 x plan_type 별 LOT 건수/중량/금액
+        plan_rows = conn.execute(f"""
+            SELECT COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
+                   COALESCE(p.plan_type, '미등록') AS plan_type,
+                   COUNT(*) AS plan_count,
+                   COALESCE(SUM(la.weight_ton),0) AS plan_weight,
+                   COALESCE(SUM(la.amount),0) AS plan_amount
+            FROM ({_lot_agg_subquery()}) la
+            LEFT JOIN depletion_plans p ON p.lot_no = la.lot_no
+            GROUP BY cc_name, plan_type
+            ORDER BY cc_name, plan_amount DESC
+        """, (ref_date,)).fetchall()
+
+        # 실적 기준: 원가중심점 x plan_type(해당 LOT의 계획유형 기준) 별 실적 건수/중량/금액
+        # 실적금액은 LOT단가 × 실적중량 방식(요구사항4와 동일 산식)으로 산출
+        unit_price_rows = conn.execute(f"""
+            SELECT lot_no, COALESCE(cost_center_name, cost_center) AS cc_name,
+                   COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton
+            FROM ({_lot_agg_subquery()}) la
+        """, (ref_date,)).fetchall()
+        unit_price = {}
+        lot_cc = {}
+        for r in unit_price_rows:
+            lot_cc[r["lot_no"]] = r["cc_name"]
+            if r["weight_ton"] and r["weight_ton"] > 0:
+                unit_price[r["lot_no"]] = r["amount"] / r["weight_ton"]
+
+        plan_type_by_lot = {
+            r["lot_no"]: (r["plan_type"] or "미등록")
+            for r in conn.execute("SELECT lot_no, plan_type FROM depletion_plans").fetchall()
+        }
+
+        actual_rows = conn.execute(
+            "SELECT lot_no, COALESCE(SUM(weight_ton),0) AS wt, COUNT(*) AS cnt FROM depletion_actuals WHERE ref_date=? GROUP BY lot_no",
+            (ref_date,)
+        ).fetchall()
+
+        actual_agg = {}  # (cc_name, plan_type) -> {count, weight, amount}
+        for a in actual_rows:
+            lot = a["lot_no"]
+            cc = lot_cc.get(lot, "미배정")
+            pt = plan_type_by_lot.get(lot, "미등록")
+            key = (cc, pt)
+            wt = abs(a["wt"] or 0.0)
+            up = unit_price.get(lot)
+            amt = wt * up if up is not None else 0.0
+            if key not in actual_agg:
+                actual_agg[key] = {"actual_count": 0, "actual_weight": 0.0, "actual_amount": 0.0}
+            actual_agg[key]["actual_count"] += 1
+            actual_agg[key]["actual_weight"] += wt
+            actual_agg[key]["actual_amount"] += amt
+
+        items = []
+        for r in plan_rows:
+            cc = r["cc_name"] or "미배정"
+            pt = r["plan_type"]
+            key = (cc, pt)
+            a = actual_agg.get(key, {"actual_count": 0, "actual_weight": 0.0, "actual_amount": 0.0})
+            items.append({
+                "cc_name": cc,
+                "plan_type": pt,
+                "plan_count": r["plan_count"],
+                "plan_weight": round(r["plan_weight"], 3),
+                "plan_amount": fmt_amount(r["plan_amount"], unit)["value"],
+                "actual_count": a["actual_count"],
+                "actual_weight": round(a["actual_weight"], 3),
+                "actual_amount": fmt_amount(a["actual_amount"], unit)["value"],
+            })
+        return {"ref_date": ref_date, "unit": unit, "items": items}
+    except Exception as e:
+        logger.error(f"cost_center_plan_type_summary 오류: {e}", exc_info=True)
+        raise HTTPException(500, f"조회 실패: {e}")
     finally:
         conn.close()
 
@@ -911,6 +1021,83 @@ async def export_inventory(
     except Exception as e:
         logger.error(f"재고 Excel 다운로드 오류: {e}", exc_info=True)
         raise HTTPException(500, f"Excel 생성 실패: {e}")
+
+
+@router.get("/inventory/export-ppt")
+async def export_inventory_ppt(
+    ref_date: Optional[str] = Query(None),
+    factory: Optional[str] = Query(None),
+    item_type: Optional[str] = Query(None),
+    unit: str = Query("HM"),
+):
+    """장기재고현황 조회 화면 PPT 다운로드 (요구사항 7)"""
+    conn = get_conn()
+    try:
+        if not ref_date:
+            ref_date = _latest_ref(conn)
+        if not ref_date:
+            raise HTTPException(404, "업로드된 재고 데이터가 없습니다.")
+        conds = ["1=1"]; params: list = []
+        if factory:   conds.append("la.factory=?");   params.append(factory)
+        if item_type: conds.append("la.item_type=?"); params.append(item_type)
+        where = " AND ".join(conds)
+
+        rows = conn.execute(f"""
+            SELECT la.factory, la.item_type, la.item_code, la.item_name,
+                   COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
+                   la.lot_no, la.weight_ton, la.amount, la.months_label,
+                   p.plan_type
+            FROM ({_lot_agg_subquery()}) la
+            LEFT JOIN depletion_plans p ON p.lot_no = la.lot_no
+            WHERE {where}
+            ORDER BY la.amount DESC
+        """, [ref_date] + params).fetchall()
+
+        summ = conn.execute(f"""
+            SELECT COUNT(*) AS tc, COALESCE(SUM(weight_ton),0) AS tw, COALESCE(SUM(amount),0) AS ta,
+                   SUM(CASE WHEN months_label='7개월이상' THEN 1 ELSE 0 END) AS cc_cnt,
+                   COALESCE(SUM(CASE WHEN months_label='7개월이상' THEN amount ELSE 0 END),0) AS cc_amt
+            FROM ({_lot_agg_subquery()}) la
+            WHERE {where}
+        """, [ref_date] + params).fetchone()
+
+        plan_cnt = conn.execute(f"""
+            SELECT COUNT(*) FROM ({_lot_agg_subquery()}) la
+            JOIN depletion_plans p ON p.lot_no = la.lot_no
+            WHERE {where}
+        """, [ref_date] + params).fetchone()[0]
+        conn.close()
+
+        items = [dict(r) for r in rows]
+        for d in items:
+            d["amount"] = fmt_amount(d["amount"], unit)["value"]
+
+        summary = {
+            "total_count": summ["tc"], "total_weight": summ["tw"],
+            "total_amount": fmt_amount(summ["ta"], unit)["value"],
+            "critical_count": summ["cc_cnt"] or 0,
+            "critical_amount": fmt_amount(summ["cc_amt"], unit)["value"],
+            "plan_count": plan_cnt,
+        }
+
+        from backend.ppt_exporter import generate_inventory_ppt
+        ppt_bytes = generate_inventory_ppt(
+            items, summary, ref_date,
+            unit_label="억원" if unit == "HM" else "백만원" if unit == "MN" else "원",
+        )
+        buf = io.BytesIO(ppt_bytes)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"장기재고현황_{ref_date}_{ts}.pptx"
+        return _pptx_response(buf, fname)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"재고 PPT 생성 오류: {e}", exc_info=True)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise HTTPException(500, f"PPT 생성 실패: {str(e)}")
 
 
 # ══════════════════════════════════════════════
@@ -1527,9 +1714,16 @@ async def export_compare_ppt(ref_date: Optional[str] = Query(None), unit: str = 
             d["amount"] = fmt_amount(d["amount"], unit)["value"]
 
         from backend.ppt_exporter import generate_compare_ppt
+        plan_trend_data = [dict(r) for r in plan_trend_rows]
+        for d in plan_trend_data:
+            d["plan_amount"] = fmt_amount(d["plan_amount"], unit)["value"]
+        cc_data = [dict(r) for r in cc_rows]
+        for d in cc_data:
+            d["total_amount"] = fmt_amount(d["total_amount"], unit)["value"]
+
         ppt_bytes = generate_compare_ppt(
             summary, items_data, ref_date,
-            [dict(r) for r in plan_trend_rows], [dict(r) for r in cc_rows],
+            plan_trend_data, cc_data,
             unit_label="억원" if unit == "HM" else "백만원" if unit == "MN" else "원",
         )
         buf = io.BytesIO(ppt_bytes)

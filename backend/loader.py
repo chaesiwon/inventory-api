@@ -264,18 +264,35 @@ def parse_inventory_file(content: bytes, filename: str, uploaded_by: str) -> dic
 
 
 def save_parsed_data(parsed: dict, uploaded_by: str) -> dict:
-    """파싱된 데이터를 DB에 저장. 동일 ref_date의 기존 데이터는 먼저 삭제 후 재적재(재업로드 시 중복 방지)."""
+    """파싱된 데이터를 DB에 저장.
+
+    [중요] 기존에는 "같은 ref_date"의 데이터를 전부 삭제하고 재적재했는데, 이러면
+    서로 다른 공장(factory)의 파일을 같은 ref_date로 각각 업로드할 경우 나중에 올린
+    파일이 먼저 올린 파일의 데이터를 지워버리는 문제가 있었다(예: 임실공장 파일 업로드 후
+    수원공장 파일을 업로드하면 임실공장 데이터가 사라짐).
+
+    이를 해결하기 위해, 삭제 범위를 "같은 ref_date이면서 같은 공장(factory)"인 데이터로
+    좁힌다. 즉 같은 공장의 같은 기준일을 재업로드하면 깨끗하게 갱신되고, 다른 공장의
+    데이터는 보존된다.
+    """
     from backend.database import get_conn
 
     upload_id = uuid.uuid4().hex[:16]
     conn = get_conn()
     try:
-        all_ref_dates = parsed["all_ref_dates"]
+        # (ref_date, factory) 조합 추출 - 재고+재공+실적 레코드 전체에서 수집
+        ref_factory_pairs = set()
+        for rec in parsed["inv_records"] + parsed["wip_records"] + parsed["act_records"]:
+            ref_factory_pairs.add((rec["ref_date"], rec.get("factory")))
 
-        # 같은 ref_date가 이미 있으면 삭제 후 재적재 (재업로드 안전성)
-        for rd in all_ref_dates:
-            conn.execute("DELETE FROM inventory_items WHERE ref_date=?", (rd,))
-            conn.execute("DELETE FROM depletion_actuals WHERE ref_date=?", (rd,))
+        for rd, factory in ref_factory_pairs:
+            if factory:
+                conn.execute("DELETE FROM inventory_items WHERE ref_date=? AND factory=?", (rd, factory))
+                conn.execute("DELETE FROM depletion_actuals WHERE ref_date=? AND factory=?", (rd, factory))
+            else:
+                # 공장 정보가 없는 예외적인 경우에는 기존 동작(ref_date 전체 삭제)으로 폴백
+                conn.execute("DELETE FROM inventory_items WHERE ref_date=? AND (factory IS NULL OR factory='')", (rd,))
+                conn.execute("DELETE FROM depletion_actuals WHERE ref_date=? AND (factory IS NULL OR factory='')", (rd,))
 
         inv_count = 0
         for rec in parsed["inv_records"] + parsed["wip_records"]:

@@ -9,3 +9,4 @@ itsdangerous
 jinja2
 aiofiles
 python-pptx
+Pillow
