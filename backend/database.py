@@ -1,10 +1,7 @@
 """
-database.py v4
-[v4 변경]
- - depletion_plans: created_by_name, updated_by_name 컬럼 추가
- - 마이그레이션: 기존 DB 유지하며 컬럼 추가 (ALTER TABLE IF NOT EXISTS)
- - 권한 관리: role 기반 (admin / user)
- - 트랜잭션 롤백 처리 적용
+database.py v6
+- 스키마는 기존 구조 유지 (마이그레이션 호환)
+- item_type='저장품' 데이터는 애플리케이션 레이어(api.py)에서 전부 제외 처리
 """
 import os, sqlite3, hashlib, logging
 from pathlib import Path
@@ -28,7 +25,6 @@ def get_conn():
     return conn
 
 def _add_col_if_not_exists(conn, table, col, dtype):
-    """기존 데이터 유지하며 컬럼 추가 (마이그레이션)"""
     try:
         existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
         if col not in existing:
@@ -86,6 +82,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_inv_lot  ON inventory_items(lot_no);
     CREATE INDEX IF NOT EXISTS idx_inv_fac  ON inventory_items(factory);
     CREATE INDEX IF NOT EXISTS idx_inv_cc   ON inventory_items(cost_center);
+    CREATE INDEX IF NOT EXISTS idx_inv_type ON inventory_items(item_type);
+
     CREATE TABLE IF NOT EXISTS depletion_plans (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         lot_no           TEXT NOT NULL UNIQUE,
@@ -109,6 +107,7 @@ def init_db():
         updated_at       TEXT DEFAULT (datetime('now','localtime'))
     );
     CREATE INDEX IF NOT EXISTS idx_dp_lot ON depletion_plans(lot_no);
+
     CREATE TABLE IF NOT EXISTS depletion_actuals (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
         upload_id          TEXT NOT NULL,
@@ -136,6 +135,7 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_da_lot      ON depletion_actuals(lot_no);
     CREATE INDEX IF NOT EXISTS idx_da_ref_date ON depletion_actuals(ref_date);
+
     CREATE TABLE IF NOT EXISTS upload_history (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         upload_id    TEXT NOT NULL UNIQUE,
@@ -156,13 +156,12 @@ def init_db():
     );
     """)
 
-    # 마이그레이션: 기존 DB에 컬럼 추가 (기존 데이터 유지)
     _add_col_if_not_exists(conn, "depletion_plans", "created_by_name", "TEXT")
     _add_col_if_not_exists(conn, "depletion_plans", "updated_by_name",  "TEXT")
     _add_col_if_not_exists(conn, "users",           "created_by",       "TEXT")
 
     _ensure_admin(conn)
-    for k, v in [("company_name","귀사"), ("current_upload_id","")]:
+    for k, v in [("company_name","귀사"), ("current_upload_id",""), ("default_amount_unit","HM")]:
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
 
     conn.commit()

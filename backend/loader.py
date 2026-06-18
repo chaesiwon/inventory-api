@@ -1,232 +1,347 @@
 """
 loader.py v3
-[v3 추가]
- - qty_consumed / amount_consumed: 전월 대비 감소 수량/금액 계산
- - LOT NO 기준으로 전월 재고 vs 당월 재고 비교
- - 원가중심점명 우선 사용
+- 장기재고현황 엑셀 업로드 파싱 + DB 저장
+- [중요] item_type='저장품'은 장기재고관리 대상에서 제외 (요청사항)
+- 파일 내 여러 '조회기준일'이 섞여 있으면 각각을 별도 스냅샷(ref_date)으로 저장
+- 재고/재공 시트: weight는 kg 단위로 입력되어 있으므로 ÷1000 하여 weight_ton 저장
+- 재고_상세/재공_상세 시트: 소진실적(actuals)로 저장. weight는 마이너스로 들어오는 경우가
+  있는데, 이는 "소진(감소)"을 의미하므로 절대값으로 저장(주석 명시)
 """
-import io
-import pandas as pd
-import numpy as np
+import io, uuid, logging
 from datetime import datetime
+from typing import Optional
 
-KG_TO_TON = 0.001
+import pandas as pd
 
-def map_actual_type(raw):
-    s = str(raw).strip() if raw and str(raw).strip() not in ("","nan") else ""
-    return "생산투입" if s in ("WIP Issue","WIP Completion") else "기타"
+logger = logging.getLogger(__name__)
 
-def _s(v, default=""):
-    if v is None: return default
-    if isinstance(v, float) and np.isnan(v): return default
+EXCLUDED_ITEM_TYPES = {"저장품"}  # 장기재고관리 제외 품목구분
+
+INV_SHEET_CANDIDATES  = ["장기재고현황_재고"]
+WIP_SHEET_CANDIDATES  = ["장기재고현황_재공"]
+ACT_INV_SHEET_CANDIDATES = ["장기재고현황_재고_상세"]
+ACT_WIP_SHEET_CANDIDATES = ["장기재고현황_재공_상세"]
+
+
+def _pick_sheet(sheet_names, candidates):
+    for c in candidates:
+        if c in sheet_names:
+            return c
+    return None
+
+
+def _to_float(v) -> float:
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _norm_date(v) -> str:
+    """조회기준일/기준일 등을 YYYYMMDD 또는 YYYY-MM-DD 문자열로 정규화하지 않고
+    원본 8자리 숫자 문자열(YYYYMMDD)을 ref_date 키로 그대로 사용한다."""
+    if v is None:
+        return ""
     s = str(v).strip()
-    return default if s in ("","nan","None","\t") else s
-
-def _f(v, default=0.0):
+    # 20260531 같은 8자리 숫자
+    if s.isdigit() and len(s) == 8:
+        return s
+    # datetime 객체로 들어온 경우
     try:
-        f = float(v); return default if np.isnan(f) else f
-    except: return default
+        if hasattr(v, "strftime"):
+            return v.strftime("%Y%m%d")
+    except Exception:
+        pass
+    return s
 
 
-def parse_inventory_file(file_bytes, filename, uploaded_by="system"):
-    upload_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    warnings = []
+def _norm_base_date(v) -> str:
+    """기준일(LOT 발생일) -> YYYY-MM-DD"""
+    if v is None or v == "":
+        return ""
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y-%m-%d")
+    s = str(v).strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
+def parse_inventory_file(content: bytes, filename: str, uploaded_by: str) -> dict:
+    """엑셀 파일을 파싱하여 재고/재공/실적 레코드 딕셔너리 리스트로 반환.
+    파일 내 여러 ref_date가 혼재된 경우 ref_date별로 그룹화하여 모두 반환한다.
+    """
     try:
-        xl = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        xls = pd.ExcelFile(io.BytesIO(content))
     except Exception as e:
-        return {"error": f"Excel 파일 열기 실패: {e}"}
+        return {"error": f"엑셀 파일을 열 수 없습니다: {e}"}
 
-    for sh in ["장기재고현황_재고","장기재고현황_재공"]:
-        if sh not in xl.sheet_names:
-            return {"error": f"필수 시트 없음: {sh}"}
+    sheet_names = xls.sheet_names
+    inv_sheet = _pick_sheet(sheet_names, INV_SHEET_CANDIDATES)
+    wip_sheet = _pick_sheet(sheet_names, WIP_SHEET_CANDIDATES)
+    act_inv_sheet = _pick_sheet(sheet_names, ACT_INV_SHEET_CANDIDATES)
+    act_wip_sheet = _pick_sheet(sheet_names, ACT_WIP_SHEET_CANDIDATES)
 
-    inventory, actuals, ref_date = [], [], ""
+    if not inv_sheet and not wip_sheet:
+        return {"error": "'장기재고현황_재고' 또는 '장기재고현황_재공' 시트를 찾을 수 없습니다."}
 
-    # ── Sheet1: 재고
-    df1 = pd.read_excel(xl, sheet_name="장기재고현황_재고", header=0, dtype=str).dropna(how="all")
-    for _, row in df1.iterrows():
-        rd = _s(row.get("조회기준일",""))
-        if rd and not ref_date: ref_date = rd
-        jg = _s(row.get("장기구분",""))
-        if jg not in ("신규","기존"): continue
-        lot = _s(row.get("Lot No",""))
-        if not lot: continue
-        wt_kg = _f(row.get("중량",0))
-        cc    = _s(row.get("원가중심점",""))
-        ccn   = _s(row.get("원가중심점명","")) or cc
-        inventory.append({
-            "ref_date":rd or ref_date, "factory":_s(row.get("공장","")),
-            "item_type":_s(row.get("품목구분","")), "item_group":_s(row.get("품목군","")),
-            "item_code":_s(row.get("품목코드","")), "item_name":_s(row.get("품명","")),
-            "cost_center":cc, "cost_center_name":ccn,
-            "lot_no":lot, "wo_no":_s(row.get("WO No","")),
-            "qty":_f(row.get("수량",0)), "weight_kg":wt_kg,
-            "weight_ton":wt_kg*KG_TO_TON,
-            "amount":_f(row.get("재고금액",0)),
-            "qty_consumed":0.0, "amount_consumed":0.0,
-            "base_date":_s(row.get("기준일","")), "months_label":_s(row.get("개월","")),
-            "is_new":1 if jg=="신규" else 0,
-            "source_sheet":"재고", "upload_id":upload_id,
-        })
+    inv_records: list = []
+    wip_records: list = []
+    act_records: list = []
+    warnings: list = []
+    excluded_count = 0
 
-    # ── Sheet2: 재공
-    df2 = pd.read_excel(xl, sheet_name="장기재고현황_재공", header=0, dtype=str).dropna(how="all")
-    for _, row in df2.iterrows():
-        rd = _s(row.get("조회기준일",""))
-        if rd and not ref_date: ref_date = rd
-        jg = _s(row.get("장기구분",""))
-        if jg not in ("신규","기존"): continue
-        lot = _s(row.get("Lot No","")) or _s(row.get("WO No",""))
-        if not lot: continue
-        wt_kg = _f(row.get("중량",0))
-        cc    = _s(row.get("원가중심점",""))
-        ccn   = _s(row.get("원가중심점명","")) or cc
-        inventory.append({
-            "ref_date":rd or ref_date, "factory":_s(row.get("공장","")),
-            "item_type":"재공품", "item_group":_s(row.get("품목군","")),
-            "item_code":_s(row.get("품목코드","")), "item_name":_s(row.get("품명","")),
-            "cost_center":cc, "cost_center_name":ccn,
-            "lot_no":lot, "wo_no":_s(row.get("WO No","")),
-            "qty":_f(row.get("수량",0)), "weight_kg":wt_kg,
-            "weight_ton":wt_kg*KG_TO_TON,
-            "amount":_f(row.get("재고금액",0)),
-            "qty_consumed":0.0, "amount_consumed":0.0,
-            "base_date":_s(row.get("기준일","")), "months_label":_s(row.get("개월","")),
-            "is_new":1 if jg=="신규" else 0,
-            "source_sheet":"재공", "upload_id":upload_id,
-        })
+    # ── 재고 시트 ──
+    if inv_sheet:
+        df = pd.read_excel(xls, sheet_name=inv_sheet)
+        for _, row in df.iterrows():
+            item_type = str(row.get("품목구분", "") or "").strip()
+            if item_type in EXCLUDED_ITEM_TYPES:
+                excluded_count += 1
+                continue  # 저장품 제외
+            ref_date = _norm_date(row.get("조회기준일"))
+            if not ref_date:
+                continue
+            weight_kg = _to_float(row.get("중량"))
+            rec = dict(
+                ref_date=ref_date,
+                factory=row.get("공장"),
+                item_type=item_type,
+                item_group=row.get("품목군"),
+                item_code=row.get("품목코드"),
+                item_name=row.get("품명"),
+                cost_center=row.get("원가중심점"),
+                cost_center_name=row.get("원가중심점명"),
+                lot_no=str(row.get("Lot No", "") or "").strip(),
+                wo_no=row.get("WO No"),
+                qty=_to_float(row.get("수량")),
+                weight_kg=weight_kg,
+                weight_ton=weight_kg / 1000.0,       # kg -> ton 변환
+                amount=_to_float(row.get("재고금액")),  # '재고금액' 컬럼 사용 확정
+                base_date=_norm_base_date(row.get("기준일")),
+                months_label=row.get("개월"),
+                is_new=1 if str(row.get("장기구분", "")).strip() == "신규" else 0,
+                source_sheet="재고",
+            )
+            if rec["lot_no"]:
+                inv_records.append(rec)
 
-    # ── Sheet3: 재고 상세 (소진실적)
-    if "장기재고현황_재고_상세" in xl.sheet_names:
-        df3 = pd.read_excel(xl, sheet_name="장기재고현황_재고_상세", header=0, dtype=str).dropna(how="all")
-        for _, row in df3.iterrows():
-            lot = _s(row.get("Lot No",""))
-            if not lot: continue
-            wt_kg = _f(row.get("중량",0)); raw_t = _s(row.get("유형",""))
-            actuals.append({
-                "ref_date":_s(row.get("조회기준일",ref_date)),
-                "factory":_s(row.get("공장","")), "item_type":_s(row.get("품목구분","")),
-                "item_group":_s(row.get("품목군","")), "item_code":_s(row.get("품목코드","")),
-                "item_name":_s(row.get("품명","")), "cost_center":_s(row.get("원가중심점","")),
-                "lot_no":lot, "wo_no":_s(row.get("WO No","")),
-                "qty":_f(row.get("수량",0)), "weight_kg":wt_kg,
-                "weight_ton":wt_kg*KG_TO_TON,
-                "qty_consumed":0.0, "amount_consumed":0.0,
-                "actual_type_raw":raw_t, "actual_type":map_actual_type(raw_t),
-                "process_date":_s(row.get("처리일자","")), "processor":_s(row.get("처리자","")),
-                "source_sheet":"재고_상세", "upload_id":upload_id,
-            })
+    # ── 재공 시트 ──
+    if wip_sheet:
+        df = pd.read_excel(xls, sheet_name=wip_sheet)
+        for _, row in df.iterrows():
+            item_type = str(row.get("품목구분", "") or "").strip()
+            if item_type in EXCLUDED_ITEM_TYPES:
+                excluded_count += 1
+                continue
+            ref_date = _norm_date(row.get("조회기준일"))
+            if not ref_date:
+                continue
+            weight_kg = _to_float(row.get("중량"))
+            lot_no = str(row.get("WO No", "") or "").strip()
+            rec = dict(
+                ref_date=ref_date,
+                factory=row.get("공장"),
+                item_type=item_type or "재공품",
+                item_group=row.get("품목군"),
+                item_code=row.get("품목코드"),
+                item_name=row.get("품명"),
+                cost_center=row.get("원가중심점"),
+                cost_center_name=row.get("원가중심점명"),
+                lot_no=lot_no,
+                wo_no=lot_no,
+                qty=_to_float(row.get("수량")),
+                weight_kg=weight_kg,
+                weight_ton=weight_kg / 1000.0,
+                amount=_to_float(row.get("재고금액")),
+                base_date=_norm_base_date(row.get("기준일")),
+                months_label=row.get("개월"),
+                is_new=1 if str(row.get("장기구분", "")).strip() == "신규" else 0,
+                source_sheet="재공",
+            )
+            if rec["lot_no"]:
+                wip_records.append(rec)
 
-    # ── Sheet4: 재공 상세 (소진실적)
-    if "장기재고현황_재공_상세" in xl.sheet_names:
-        df4 = pd.read_excel(xl, sheet_name="장기재고현황_재공_상세", header=0, dtype=str).dropna(how="all")
-        for _, row in df4.iterrows():
-            lot = _s(row.get("WO No",""))
-            if not lot: continue
-            wt_kg = _f(row.get("중량",0)); raw_t = _s(row.get("유형",""))
-            actuals.append({
-                "ref_date":_s(row.get("조회기준일",ref_date)),
-                "factory":_s(row.get("공장","")), "item_type":"재공품",
-                "item_group":_s(row.get("품목군","")), "item_code":_s(row.get("품목코드","")),
-                "item_name":_s(row.get("품명","")), "cost_center":_s(row.get("원가중심점","")),
-                "lot_no":lot, "wo_no":lot,
-                "qty":_f(row.get("수량",0)), "weight_kg":wt_kg,
-                "weight_ton":wt_kg*KG_TO_TON,
-                "qty_consumed":0.0, "amount_consumed":0.0,
-                "actual_type_raw":raw_t, "actual_type":map_actual_type(raw_t),
-                "process_date":_s(row.get("처리일자","")), "processor":_s(row.get("처리자","")),
-                "source_sheet":"재공_상세", "upload_id":upload_id,
-            })
+    # ── 재고_상세(실적) 시트 ──
+    if act_inv_sheet:
+        df = pd.read_excel(xls, sheet_name=act_inv_sheet)
+        for _, row in df.iterrows():
+            item_type = str(row.get("품목구분", "") or "").strip()
+            if item_type in EXCLUDED_ITEM_TYPES:
+                continue
+            ref_date = _norm_date(row.get("조회기준일"))
+            if not ref_date:
+                continue
+            weight_raw = _to_float(row.get("중량"))
+            rec = dict(
+                ref_date=ref_date,
+                factory=row.get("공장"),
+                item_type=item_type,
+                item_group=row.get("품목군"),
+                item_code=row.get("품목코드"),
+                item_name=row.get("품명"),
+                cost_center=row.get("원가중심점"),
+                lot_no=str(row.get("Lot No", "") or "").strip(),
+                wo_no=row.get("WO No"),
+                qty=_to_float(row.get("수량")),
+                weight_kg=abs(weight_raw),
+                # 음수는 "소진(감소)"을 의미 -> 절대값으로 저장
+                weight_ton=abs(weight_raw) / 1000.0,
+                actual_type_raw=row.get("유형"),
+                actual_type=row.get("유형"),
+                process_date=_norm_base_date(row.get("처리일자")),
+                processor=row.get("처리자"),
+                source_sheet="재고_상세",
+            )
+            if rec["lot_no"]:
+                act_records.append(rec)
 
-    return {"upload_id":upload_id, "ref_date":ref_date,
-            "inventory":inventory, "actuals":actuals,
-            "warnings":warnings, "filename":filename}
+    # ── 재공_상세(실적) 시트 ──
+    if act_wip_sheet:
+        df = pd.read_excel(xls, sheet_name=act_wip_sheet)
+        for _, row in df.iterrows():
+            item_type = str(row.get("품목구분", "") or "").strip()
+            if item_type in EXCLUDED_ITEM_TYPES:
+                continue
+            ref_date = _norm_date(row.get("조회기준일"))
+            if not ref_date:
+                continue
+            weight_raw = _to_float(row.get("중량"))
+            lot_no = str(row.get("WO No", "") or "").strip()
+            rec = dict(
+                ref_date=ref_date,
+                factory=row.get("공장"),
+                item_type=item_type or "재공품",
+                item_group=row.get("품목군"),
+                item_code=row.get("품목코드"),
+                item_name=row.get("품명"),
+                cost_center=row.get("원가중심점"),
+                lot_no=lot_no,
+                wo_no=lot_no,
+                qty=_to_float(row.get("수량")),
+                weight_kg=abs(weight_raw),
+                weight_ton=abs(weight_raw) / 1000.0,
+                actual_type_raw=row.get("유형"),
+                actual_type=row.get("유형"),
+                process_date=_norm_base_date(row.get("처리일자")),
+                processor=row.get("처리자"),
+                source_sheet="재공_상세",
+            )
+            if rec["lot_no"]:
+                act_records.append(rec)
 
+    all_ref_dates = sorted(set(
+        [r["ref_date"] for r in inv_records] +
+        [r["ref_date"] for r in wip_records] +
+        [r["ref_date"] for r in act_records]
+    ))
+    if not all_ref_dates:
+        return {"error": "유효한 조회기준일을 찾을 수 없습니다."}
 
-def _calc_consumed(parsed, conn):
-    """
-    전월 대비 수량 감소 → 소진 수량/금액 계산
-    LOT NO 기준: 전월 qty - 당월 qty = 소진 qty
-    소진 금액 = 소진 qty / 당월 qty * 당월 amount
-    """
-    rd = parsed["ref_date"]
-    # 이전 기준일 조회
-    prev_row = conn.execute(
-        "SELECT ref_date FROM inventory_items WHERE ref_date < ? ORDER BY ref_date DESC LIMIT 1",
-        (rd,)
-    ).fetchone()
-    if not prev_row:
-        return  # 전월 데이터 없으면 건너뜀
+    latest_ref = all_ref_dates[-1]
 
-    prev_rd = prev_row["ref_date"]
-    prev_data = {
-        r["lot_no"]: {"qty": r["qty"], "amount": r["amount"]}
-        for r in conn.execute(
-            "SELECT lot_no, qty, amount FROM inventory_items WHERE ref_date=?", (prev_rd,)
-        ).fetchall()
+    if excluded_count:
+        warnings.append(f"저장품 {excluded_count}건은 장기재고관리 대상에서 제외되었습니다.")
+    if len(all_ref_dates) > 1:
+        warnings.append(
+            f"파일 안에 {len(all_ref_dates)}개의 조회기준일({', '.join(all_ref_dates)})이 "
+            f"포함되어 있어 각각 별도 스냅샷으로 저장됩니다."
+        )
+
+    return {
+        "ref_date": latest_ref,
+        "all_ref_dates": all_ref_dates,
+        "inv_records": inv_records,
+        "wip_records": wip_records,
+        "act_records": act_records,
+        "filename": filename,
+        "uploaded_by": uploaded_by,
+        "warnings": warnings,
+        "excluded_count": excluded_count,
     }
 
-    for item in parsed["inventory"]:
-        lot = item["lot_no"]
-        if lot in prev_data:
-            prev_qty = prev_data[lot]["qty"]
-            curr_qty = item["qty"]
-            consumed = max(0, prev_qty - curr_qty)  # 감소분만
-            if consumed > 0 and curr_qty > 0:
-                # 단가 = 당월 금액 / 당월 수량
-                unit_price = item["amount"] / curr_qty if curr_qty else 0
-                item["qty_consumed"]    = consumed
-                item["amount_consumed"] = round(consumed * unit_price, 0)
-            elif consumed > 0 and curr_qty == 0:
-                # 당월에 아예 없어진 경우
-                prev_amt = prev_data[lot]["amount"]
-                item["qty_consumed"]    = consumed
-                item["amount_consumed"] = round(prev_amt * (consumed / prev_qty), 0)
 
-
-def save_parsed_data(parsed, uploaded_by="system"):
+def save_parsed_data(parsed: dict, uploaded_by: str) -> dict:
+    """파싱된 데이터를 DB에 저장. 동일 ref_date의 기존 데이터는 먼저 삭제 후 재적재(재업로드 시 중복 방지)."""
     from backend.database import get_conn
+
+    upload_id = uuid.uuid4().hex[:16]
     conn = get_conn()
-    uid  = parsed["upload_id"]
-    rd   = parsed["ref_date"]
+    try:
+        all_ref_dates = parsed["all_ref_dates"]
 
-    # 소진 수량/금액 계산 (전월 데이터 있을 때만)
-    _calc_consumed(parsed, conn)
+        # 같은 ref_date가 이미 있으면 삭제 후 재적재 (재업로드 안전성)
+        for rd in all_ref_dates:
+            conn.execute("DELETE FROM inventory_items WHERE ref_date=?", (rd,))
+            conn.execute("DELETE FROM depletion_actuals WHERE ref_date=?", (rd,))
 
-    conn.execute("DELETE FROM inventory_items    WHERE ref_date=?", (rd,))
-    conn.execute("DELETE FROM depletion_actuals  WHERE ref_date=?", (rd,))
+        inv_count = 0
+        for rec in parsed["inv_records"] + parsed["wip_records"]:
+            conn.execute("""
+                INSERT INTO inventory_items
+                (upload_id, ref_date, factory, item_type, item_group, item_code, item_name,
+                 cost_center, cost_center_name, lot_no, wo_no, qty, weight_kg, weight_ton,
+                 amount, qty_consumed, amount_consumed, base_date, months_label, is_new, source_sheet)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                upload_id, rec["ref_date"], rec["factory"], rec["item_type"], rec["item_group"],
+                rec["item_code"], rec["item_name"], rec["cost_center"], rec["cost_center_name"],
+                rec["lot_no"], rec["wo_no"], rec["qty"], rec["weight_kg"], rec["weight_ton"],
+                rec["amount"], 0, 0, rec["base_date"], rec["months_label"], rec["is_new"],
+                rec["source_sheet"],
+            ))
+            inv_count += 1
 
-    for item in parsed["inventory"]:
-        conn.execute("""INSERT INTO inventory_items
-            (upload_id,ref_date,factory,item_type,item_group,item_code,item_name,
-             cost_center,cost_center_name,lot_no,wo_no,qty,weight_kg,weight_ton,
-             amount,qty_consumed,amount_consumed,base_date,months_label,is_new,source_sheet)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [item.get(c) for c in
-             ("upload_id","ref_date","factory","item_type","item_group","item_code","item_name",
-              "cost_center","cost_center_name","lot_no","wo_no","qty","weight_kg","weight_ton",
-              "amount","qty_consumed","amount_consumed","base_date","months_label","is_new","source_sheet")])
+        act_count = 0
+        for rec in parsed["act_records"]:
+            conn.execute("""
+                INSERT INTO depletion_actuals
+                (upload_id, ref_date, factory, item_type, item_group, item_code, item_name,
+                 cost_center, lot_no, wo_no, qty, weight_kg, weight_ton,
+                 actual_type_raw, actual_type, process_date, processor, source_sheet)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                upload_id, rec["ref_date"], rec["factory"], rec["item_type"], rec["item_group"],
+                rec["item_code"], rec["item_name"], rec["cost_center"], rec["lot_no"], rec["wo_no"],
+                rec["qty"], rec["weight_kg"], rec["weight_ton"],
+                rec["actual_type_raw"], rec["actual_type"], rec["process_date"], rec["processor"],
+                rec["source_sheet"],
+            ))
+            act_count += 1
 
-    for act in parsed["actuals"]:
-        conn.execute("""INSERT INTO depletion_actuals
-            (upload_id,ref_date,factory,item_type,item_group,item_code,item_name,
-             cost_center,lot_no,wo_no,qty,weight_kg,weight_ton,
-             qty_consumed,amount_consumed,actual_type_raw,actual_type,
-             process_date,processor,source_sheet)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [act.get(c) for c in
-             ("upload_id","ref_date","factory","item_type","item_group","item_code","item_name",
-              "cost_center","lot_no","wo_no","qty","weight_kg","weight_ton",
-              "qty_consumed","amount_consumed","actual_type_raw","actual_type",
-              "process_date","processor","source_sheet")])
+        latest_rd = parsed["ref_date"]
+        total_amount = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM inventory_items WHERE ref_date=?", (latest_rd,)
+        ).fetchone()[0]
+        inv_only = conn.execute(
+            "SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재고'", (latest_rd,)
+        ).fetchone()[0]
+        wip_only = conn.execute(
+            "SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재공'", (latest_rd,)
+        ).fetchone()[0]
+        act_only = conn.execute(
+            "SELECT COUNT(*) FROM depletion_actuals WHERE ref_date=?", (latest_rd,)
+        ).fetchone()[0]
 
-    inv_cnt = sum(1 for i in parsed["inventory"] if i.get("source_sheet")=="재고")
-    wip_cnt = sum(1 for i in parsed["inventory"] if i.get("source_sheet")=="재공")
-    total_a = sum(i.get("amount",0) for i in parsed["inventory"])
-    conn.execute("""INSERT OR REPLACE INTO upload_history
-        (upload_id,filename,ref_date,inv_count,wip_count,act_count,total_amount,uploaded_by)
-        VALUES (?,?,?,?,?,?,?,?)""",
-        (uid,parsed.get("filename",""),rd,inv_cnt,wip_cnt,len(parsed["actuals"]),total_a,uploaded_by))
-    conn.commit(); conn.close()
-    return {"upload_id":uid,"inv_count":inv_cnt,"wip_count":wip_cnt,
-            "act_count":len(parsed["actuals"]),"total_amount":total_a}
+        conn.execute("""
+            INSERT INTO upload_history
+            (upload_id, filename, ref_date, inv_count, wip_count, act_count, total_amount, uploaded_by)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (upload_id, parsed["filename"], latest_rd, inv_only, wip_only, act_only,
+              total_amount, uploaded_by))
+
+        conn.commit()
+        return {
+            "upload_id": upload_id,
+            "inv_count": inv_only,
+            "wip_count": wip_only,
+            "act_count": act_only,
+            "total_amount": float(total_amount),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
