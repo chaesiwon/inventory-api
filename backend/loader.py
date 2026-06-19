@@ -329,18 +329,43 @@ def save_parsed_data(parsed: dict, uploaded_by: str) -> dict:
             act_count += 1
 
         latest_rd = parsed["ref_date"]
-        total_amount = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM inventory_items WHERE ref_date=?", (latest_rd,)
-        ).fetchone()[0]
-        inv_only = conn.execute(
-            "SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재고'", (latest_rd,)
-        ).fetchone()[0]
-        wip_only = conn.execute(
-            "SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재공'", (latest_rd,)
-        ).fetchone()[0]
-        act_only = conn.execute(
-            "SELECT COUNT(*) FROM depletion_actuals WHERE ref_date=?", (latest_rd,)
-        ).fetchone()[0]
+
+        # [버그 수정] 기존에는 ref_date만으로 집계해서, 같은 ref_date에 여러 공장 파일이
+        # 누적되면 나중에 올린 파일의 upload_history에 "전체 합산"이 찍히는 문제가 있었다.
+        # 이번 업로드로 실제로 들어온 (ref_date, factory) 조합만으로 좁혀서 집계한다.
+        this_upload_factories = {f for _, f in ref_factory_pairs if f}
+        if this_upload_factories:
+            factory_in = ",".join("?" * len(this_upload_factories))
+            total_amount = conn.execute(
+                f"SELECT COALESCE(SUM(amount),0) FROM inventory_items WHERE ref_date=? AND factory IN ({factory_in})",
+                (latest_rd, *this_upload_factories)
+            ).fetchone()[0]
+            inv_only = conn.execute(
+                f"SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재고' AND factory IN ({factory_in})",
+                (latest_rd, *this_upload_factories)
+            ).fetchone()[0]
+            wip_only = conn.execute(
+                f"SELECT COUNT(*) FROM inventory_items WHERE ref_date=? AND source_sheet='재공' AND factory IN ({factory_in})",
+                (latest_rd, *this_upload_factories)
+            ).fetchone()[0]
+            act_only = conn.execute(
+                f"SELECT COUNT(*) FROM depletion_actuals WHERE ref_date=? AND factory IN ({factory_in})",
+                (latest_rd, *this_upload_factories)
+            ).fetchone()[0]
+        else:
+            # 공장 정보가 없는 예외적인 경우 - 이번 업로드분의 upload_id로 직접 집계
+            total_amount = conn.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM inventory_items WHERE upload_id=?", (upload_id,)
+            ).fetchone()[0]
+            inv_only = conn.execute(
+                "SELECT COUNT(*) FROM inventory_items WHERE upload_id=? AND source_sheet='재고'", (upload_id,)
+            ).fetchone()[0]
+            wip_only = conn.execute(
+                "SELECT COUNT(*) FROM inventory_items WHERE upload_id=? AND source_sheet='재공'", (upload_id,)
+            ).fetchone()[0]
+            act_only = conn.execute(
+                "SELECT COUNT(*) FROM depletion_actuals WHERE upload_id=?", (upload_id,)
+            ).fetchone()[0]
 
         conn.execute("""
             INSERT INTO upload_history

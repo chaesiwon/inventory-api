@@ -320,6 +320,31 @@ async def ref_dates():
         conn.close()
 
 
+@router.get("/inventory/filter-options")
+async def inventory_filter_options(ref_date: Optional[str] = Query(None)):
+    """대시보드/조회/비교 화면의 공장·원가중심점 드롭다운에 사용할 목록."""
+    conn = get_conn()
+    try:
+        if not ref_date:
+            ref_date = _latest_ref(conn)
+        factories = conn.execute(
+            f"SELECT DISTINCT factory FROM inventory_items i WHERE {EXCLUDE_STORAGE} AND ref_date=? "
+            f"AND factory IS NOT NULL AND factory != '' ORDER BY factory",
+            (ref_date,)
+        ).fetchall()
+        cost_centers = conn.execute(
+            f"SELECT DISTINCT cost_center, cost_center_name FROM inventory_items i WHERE {EXCLUDE_STORAGE} AND ref_date=? "
+            f"AND cost_center_name IS NOT NULL AND cost_center_name != '' ORDER BY cost_center_name",
+            (ref_date,)
+        ).fetchall()
+        return {
+            "factories": [r["factory"] for r in factories],
+            "cost_centers": [{"code": r["cost_center"], "name": r["cost_center_name"]} for r in cost_centers],
+        }
+    finally:
+        conn.close()
+
+
 # ══════════════════════════════════════════════
 # 업로드
 # ══════════════════════════════════════════════
@@ -436,9 +461,20 @@ async def delete_all(request: Request):
 #    depletion_plans/actuals와 JOIN하기 전에 반드시 LOT 단위로 먼저 GROUP BY 집계한
 #    서브쿼리(lot_agg)를 만들어 1:1 매칭을 보장한다. 절대 inventory_items를 직접 JOIN하지 않는다.
 
-def _lot_agg_subquery(ref_date_param_placeholder: str = "?") -> str:
+def _lot_agg_subquery(ref_date_param_placeholder: str = "?", factory: Optional[str] = None,
+                       cost_center: Optional[str] = None) -> str:
     """LOT 단위로 먼저 집계하는 서브쿼리. 저장품 제외 적용됨.
-    SUM 결과가 NULL이 되는 경우(그룹 내 모든 값이 NULL)를 방지하기 위해 COALESCE 적용."""
+    SUM 결과가 NULL이 되는 경우(그룹 내 모든 값이 NULL)를 방지하기 위해 COALESCE 적용.
+
+    [중요] factory/cost_center 필터를 켜면, 이 서브쿼리를 사용하는 SQL의 파라미터 바인딩 순서는
+    반드시 (ref_date, [factory], [cost_center], ...나머지) 순서를 지켜야 한다.
+    파라미터 개수가 동적으로 바뀌므로, 호출부는 _lot_agg_params() 헬퍼로 짝을 맞춰 사용한다.
+    """
+    extra = ""
+    if factory:
+        extra += " AND factory = ?"
+    if cost_center:
+        extra += " AND (cost_center = ? OR cost_center_name LIKE ?)"
     return f"""
         SELECT lot_no,
                MIN(factory) AS factory, MIN(item_type) AS item_type,
@@ -450,15 +486,46 @@ def _lot_agg_subquery(ref_date_param_placeholder: str = "?") -> str:
                COALESCE(SUM(weight_ton),0) AS weight_ton,
                COALESCE(SUM(qty),0) AS qty
         FROM inventory_items i
-        WHERE {EXCLUDE_STORAGE} AND ref_date = {ref_date_param_placeholder}
+        WHERE {EXCLUDE_STORAGE} AND ref_date = {ref_date_param_placeholder}{extra}
         GROUP BY lot_no
     """
+
+
+def _lot_agg_params(ref_date, factory: Optional[str] = None, cost_center: Optional[str] = None) -> list:
+    """_lot_agg_subquery와 짝을 맞추는 파라미터 리스트. ref_date 뒤에 factory/cost_center를 순서대로 추가."""
+    params = [ref_date]
+    if factory:
+        params.append(factory)
+    if cost_center:
+        params.append(cost_center)
+        params.append(f"%{cost_center}%")
+    return params
+
+
+def _actual_type_to_plan_type(actual_type_raw: Optional[str]) -> Optional[str]:
+    """실적유형(상세시트의 '유형' 컬럼) 문자열을 소진계획방안 카테고리로 매핑.
+    [사용자 확정 규칙]
+      - 'Sales'로 시작 -> '전환 판매' 실적
+      - 'WIP'로 시작   -> '생산투입' 실적
+      - 그 외(Account alias issue, Direct Org Transfer 등) -> 매핑 없음(None, 기타로 집계)
+    대소문자 구분 없이 비교한다.
+    """
+    if not actual_type_raw:
+        return None
+    s = str(actual_type_raw).strip().lower()
+    if s.startswith("sales"):
+        return "전환 판매"
+    if s.startswith("wip"):
+        return "생산투입"
+    return None
 
 
 @router.get("/dashboard/kpi")
 async def dashboard_kpi(
     ref_date: Optional[str] = Query(None),
     unit: str = Query("HM", description="KRW|MN|HM"),
+    factory: Optional[str] = Query(None, description="공장 필터 (예: 임실공장). 비우면 전체"),
+    cost_center: Optional[str] = Query(None, description="원가중심점 필터(부분일치). 비우면 전체"),
 ):
     conn = get_conn()
     try:
@@ -478,14 +545,18 @@ async def dashboard_kpi(
         prev_rd = _prev_ref(conn, ref_date, "month")
         today_month = date.today().strftime("%Y-%m")  # 요구사항2,6: 시스템 오늘 날짜 기준 당월
 
+        def _lot_sql(rd):
+            return _lot_agg_subquery(factory=factory, cost_center=cost_center), _lot_agg_params(rd, factory, cost_center)
+
         # ── ① 총 장기재고 (LOT 집계 기준) ──
         def _total(rd):
             if not rd:
                 return {"amount": 0.0, "weight_ton": 0.0, "count": 0}
+            sql, params = _lot_sql(rd)
             r = conn.execute(f"""
                 SELECT COALESCE(SUM(amount),0) AS ta, COALESCE(SUM(weight_ton),0) AS tw, COUNT(*) AS tc
-                FROM ({_lot_agg_subquery()}) lot_agg
-            """, (rd,)).fetchone()
+                FROM ({sql}) lot_agg
+            """, params).fetchone()
             return {"amount": float(r["ta"]), "weight_ton": float(r["tw"]), "count": int(r["tc"])}
 
         total_cur = _total(ref_date)
@@ -495,12 +566,13 @@ async def dashboard_kpi(
         def _plan_this_month(rd):
             if not rd:
                 return {"amount": 0.0, "weight_ton": 0.0, "count": 0}
+            sql, params = _lot_sql(rd)
             r = conn.execute(f"""
                 SELECT COALESCE(SUM(la.amount),0) AS ta, COALESCE(SUM(la.weight_ton),0) AS tw, COUNT(*) AS tc
-                FROM ({_lot_agg_subquery()}) la
+                FROM ({sql}) la
                 JOIN depletion_plans p ON p.lot_no = la.lot_no
                 WHERE substr(p.plan_date,1,7) = ?
-            """, (rd, today_month)).fetchone()
+            """, params + [today_month]).fetchone()
             return {"amount": float(r["ta"]), "weight_ton": float(r["tw"]), "count": int(r["tc"])}
 
         plan_this_cur = _plan_this_month(ref_date)
@@ -510,16 +582,17 @@ async def dashboard_kpi(
         def _uncompleted_this_month(rd):
             if not rd:
                 return {"amount": 0.0, "weight_ton": 0.0, "count": 0}
+            sql, params = _lot_sql(rd)
             r = conn.execute(f"""
                 SELECT COALESCE(SUM(la.amount),0) AS ta, COALESCE(SUM(la.weight_ton),0) AS tw, COUNT(*) AS tc
-                FROM ({_lot_agg_subquery()}) la
+                FROM ({sql}) la
                 JOIN depletion_plans p ON p.lot_no = la.lot_no
                 WHERE substr(p.plan_date,1,7) = ?
                   AND NOT EXISTS (
                       SELECT 1 FROM depletion_actuals a
                       WHERE a.lot_no = la.lot_no AND a.ref_date = ?
                   )
-            """, (rd, today_month, rd)).fetchone()
+            """, params + [today_month, rd]).fetchone()
             return {"amount": float(r["ta"]), "weight_ton": float(r["tw"]), "count": int(r["tc"])}
 
         uncompleted_cur = _uncompleted_this_month(ref_date)
@@ -529,11 +602,12 @@ async def dashboard_kpi(
         def _completed(rd):
             if not rd:
                 return {"amount": 0.0, "weight_ton": 0.0, "count": 0}
+            sql, params = _lot_sql(rd)
             # LOT별 단가 산출 (weight_ton > 0 인 경우만; amount/weight_ton 모두 COALESCE로 NULL 방지)
             unit_price_rows = conn.execute(f"""
                 SELECT lot_no, COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton
-                FROM ({_lot_agg_subquery()}) la
-            """, (rd,)).fetchall()
+                FROM ({sql}) la
+            """, params).fetchall()
             unit_price = {
                 row["lot_no"]: (row["amount"] / row["weight_ton"])
                 for row in unit_price_rows
@@ -566,18 +640,20 @@ async def dashboard_kpi(
         def _consumed_mom(cur_rd, prv_rd):
             if not cur_rd or not prv_rd:
                 return {"amount": 0.0, "weight_ton": 0.0, "count": 0}
+            cur_sql, cur_params = _lot_sql(cur_rd)
+            prv_sql, prv_params = _lot_sql(prv_rd)
             cur_lots = {
                 row["lot_no"]: (row["amount"] or 0.0, row["weight_ton"] or 0.0)
                 for row in conn.execute(
-                    f"SELECT lot_no, COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton FROM ({_lot_agg_subquery()}) la",
-                    (cur_rd,)
+                    f"SELECT lot_no, COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton FROM ({cur_sql}) la",
+                    cur_params
                 ).fetchall()
             }
             prev_lots = {
                 row["lot_no"]: (row["amount"] or 0.0, row["weight_ton"] or 0.0)
                 for row in conn.execute(
-                    f"SELECT lot_no, COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton FROM ({_lot_agg_subquery()}) la",
-                    (prv_rd,)
+                    f"SELECT lot_no, COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton FROM ({prv_sql}) la",
+                    prv_params
                 ).fetchall()
             }
             total_amt = 0.0
@@ -616,6 +692,8 @@ async def dashboard_kpi(
             "prev_ref_date": prev_rd,
             "unit": unit,
             "today_month": today_month,
+            "factory": factory,
+            "cost_center": cost_center,
             "total": _pack(total_cur, total_prev),
             "plan_this_month": _pack(plan_this_cur, plan_this_prev),
             "uncompleted_this_month": _pack(uncompleted_cur, uncompleted_prev),
@@ -630,17 +708,22 @@ async def dashboard_kpi(
 
 
 @router.get("/dashboard/critical-stock")
-async def critical_stock_summary(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+async def critical_stock_summary(
+    ref_date: Optional[str] = Query(None), unit: str = Query("HM"),
+    factory: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
+):
     """7개월이상 장기재고(months_label='7개월이상') 집중관리 요약."""
     conn = get_conn()
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
+        sql = _lot_agg_subquery(factory=factory, cost_center=cost_center)
+        params = _lot_agg_params(ref_date, factory, cost_center)
         r = conn.execute(f"""
             SELECT COALESCE(SUM(amount),0) AS ta, COALESCE(SUM(weight_ton),0) AS tw, COUNT(*) AS tc
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             WHERE months_label = '7개월이상'
-        """, (ref_date,)).fetchone()
+        """, params).fetchone()
         return {
             "ref_date": ref_date,
             "amount": fmt_amount(r["ta"], unit)["value"],
@@ -652,11 +735,16 @@ async def critical_stock_summary(ref_date: Optional[str] = Query(None), unit: st
 
 
 @router.get("/dashboard/top20")
-async def top20(ref_date: Optional[str] = Query(None)):
+async def top20(
+    ref_date: Optional[str] = Query(None),
+    factory: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
+):
     conn = get_conn()
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
+        sql = _lot_agg_subquery(factory=factory, cost_center=cost_center)
+        params = _lot_agg_params(ref_date, factory, cost_center)
         rows = conn.execute(f"""
             SELECT la.factory, la.item_type, la.item_code, la.item_name,
                    COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
@@ -664,12 +752,12 @@ async def top20(ref_date: Optional[str] = Query(None)):
                    la.base_date, la.months_label, la.is_new,
                    p.plan_type, p.plan_date, p.dept,
                    CASE WHEN ax.lot_no IS NOT NULL THEN 1 ELSE 0 END AS is_completed
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             LEFT JOIN depletion_plans p ON p.lot_no = la.lot_no
             LEFT JOIN (SELECT DISTINCT lot_no FROM depletion_actuals WHERE ref_date=?) ax
                    ON ax.lot_no = la.lot_no
             ORDER BY la.amount DESC LIMIT 20
-        """, (ref_date, ref_date)).fetchall()
+        """, params + [ref_date]).fetchall()
         return {"ref_date": ref_date, "items": [dict(r) for r in rows]}
     except Exception as e:
         logger.error(f"TOP20 오류: {e}", exc_info=True)
@@ -731,11 +819,16 @@ async def plan_weight_trend(unit: str = Query("HM")):
 
 
 @router.get("/dashboard/cost-center-summary")
-async def cost_center_summary(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+async def cost_center_summary(
+    ref_date: Optional[str] = Query(None), unit: str = Query("HM"),
+    factory: Optional[str] = Query(None),
+):
     conn = get_conn()
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
+        sql = _lot_agg_subquery(factory=factory)
+        params = _lot_agg_params(ref_date, factory)
         rows = conn.execute(f"""
             SELECT COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
                    la.cost_center,
@@ -744,13 +837,13 @@ async def cost_center_summary(ref_date: Optional[str] = Query(None), unit: str =
                    COALESCE(SUM(la.amount),0) AS total_amount,
                    COUNT(p.lot_no) AS plan_count,
                    COUNT(ax.lot_no) AS actual_count
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             LEFT JOIN depletion_plans p ON p.lot_no = la.lot_no
             LEFT JOIN (SELECT DISTINCT lot_no FROM depletion_actuals WHERE ref_date=?) ax
                    ON ax.lot_no = la.lot_no
             GROUP BY la.cost_center, la.cost_center_name
             ORDER BY total_amount DESC
-        """, (ref_date, ref_date)).fetchall()
+        """, params + [ref_date]).fetchall()
         items = []
         for r in rows:
             d = dict(r)
@@ -763,16 +856,27 @@ async def cost_center_summary(ref_date: Optional[str] = Query(None), unit: str =
 
 
 @router.get("/dashboard/cost-center-plan-type-summary")
-async def cost_center_plan_type_summary(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+async def cost_center_plan_type_summary(
+    ref_date: Optional[str] = Query(None), unit: str = Query("HM"),
+    factory: Optional[str] = Query(None),
+):
     """
     원가중심점 × 소진계획방안(plan_type) 별 교차 집계.
     각 조합에 대해 계획 기준(건수/중량/금액)과 실적 기준(건수/중량/금액)을 모두 산출.
-    실적 건수/중량/금액은 depletion_actuals(상세시트)를 LOT 단위로 집계 후 매칭.
+
+    [요구사항 7] 실적 집계 기준 변경:
+    실적유형(상세시트 '유형' 컬럼)이 'Sales'로 시작하면 '전환 판매' 실적로, 'WIP'로 시작하면
+    '생산투입' 실적로 집계한다 (해당 LOT에 등록된 계획유형과는 무관하게, 실적유형 자체가
+    어떤 방안에 대한 실적인지를 결정한다). 이 둘에 해당하지 않는 실적유형은 집계에서 제외한다
+    (원가중심점x계획방안 표는 계획방안 4종 기준이므로, 매핑 불가능한 실적은 별도 노출하지 않음).
     """
     conn = get_conn()
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
+
+        sql = _lot_agg_subquery(factory=factory)
+        params = _lot_agg_params(ref_date, factory)
 
         # 계획 기준: 원가중심점 x plan_type 별 LOT 건수/중량/금액
         plan_rows = conn.execute(f"""
@@ -781,19 +885,18 @@ async def cost_center_plan_type_summary(ref_date: Optional[str] = Query(None), u
                    COUNT(*) AS plan_count,
                    COALESCE(SUM(la.weight_ton),0) AS plan_weight,
                    COALESCE(SUM(la.amount),0) AS plan_amount
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             LEFT JOIN depletion_plans p ON p.lot_no = la.lot_no
             GROUP BY cc_name, plan_type
             ORDER BY cc_name, plan_amount DESC
-        """, (ref_date,)).fetchall()
+        """, params).fetchall()
 
-        # 실적 기준: 원가중심점 x plan_type(해당 LOT의 계획유형 기준) 별 실적 건수/중량/금액
-        # 실적금액은 LOT단가 × 실적중량 방식(요구사항4와 동일 산식)으로 산출
+        # LOT별 단가 및 원가중심점 매핑 (실적금액 산출용, factory 필터 동일 적용)
         unit_price_rows = conn.execute(f"""
             SELECT lot_no, COALESCE(cost_center_name, cost_center) AS cc_name,
                    COALESCE(amount,0) AS amount, COALESCE(weight_ton,0) AS weight_ton
-            FROM ({_lot_agg_subquery()}) la
-        """, (ref_date,)).fetchall()
+            FROM ({sql}) la
+        """, params).fetchall()
         unit_price = {}
         lot_cc = {}
         for r in unit_price_rows:
@@ -801,23 +904,25 @@ async def cost_center_plan_type_summary(ref_date: Optional[str] = Query(None), u
             if r["weight_ton"] and r["weight_ton"] > 0:
                 unit_price[r["lot_no"]] = r["amount"] / r["weight_ton"]
 
-        plan_type_by_lot = {
-            r["lot_no"]: (r["plan_type"] or "미등록")
-            for r in conn.execute("SELECT lot_no, plan_type FROM depletion_plans").fetchall()
-        }
-
+        # 실적 기준: actual_type(원본 '유형' 문자열) -> plan_type 매핑(요구사항7 규칙)으로 분류
         actual_rows = conn.execute(
-            "SELECT lot_no, COALESCE(SUM(weight_ton),0) AS wt, COUNT(*) AS cnt FROM depletion_actuals WHERE ref_date=? GROUP BY lot_no",
+            "SELECT lot_no, actual_type_manual, actual_type_raw, weight_ton FROM depletion_actuals WHERE ref_date=?",
             (ref_date,)
         ).fetchall()
 
         actual_agg = {}  # (cc_name, plan_type) -> {count, weight, amount}
         for a in actual_rows:
             lot = a["lot_no"]
+            if lot not in lot_cc:
+                continue  # factory 필터에 의해 이번 집계 대상이 아닌 LOT
+            # 사용자가 수동으로 실적유형을 보정했다면 그 값을 우선 사용
+            raw = a["actual_type_manual"] or a["actual_type_raw"]
+            mapped_pt = _actual_type_to_plan_type(raw)
+            if mapped_pt is None:
+                continue  # Sales/WIP 패턴에 해당하지 않는 실적유형은 이 표에서 제외
             cc = lot_cc.get(lot, "미배정")
-            pt = plan_type_by_lot.get(lot, "미등록")
-            key = (cc, pt)
-            wt = abs(a["wt"] or 0.0)
+            key = (cc, mapped_pt)
+            wt = abs(a["weight_ton"] or 0.0)
             up = unit_price.get(lot)
             amt = wt * up if up is not None else 0.0
             if key not in actual_agg:
@@ -1244,7 +1349,7 @@ async def bulk_upload_plans(request: Request, file: UploadFile = File(...)):
 async def inventory_no_plan(
     ref_date: Optional[str] = Query(None), factory: Optional[str] = Query(None),
     item_name: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
-    lot_no: Optional[str] = Query(None),
+    lot_no: Optional[str] = Query(None), item_code: Optional[str] = Query(None),
     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500),
     unit: str = Query("HM"),
 ):
@@ -1256,6 +1361,7 @@ async def inventory_no_plan(
         params: list = []
         if factory:     conds.append("la.factory=?");        params.append(factory)
         if item_name:   conds.append("la.item_name LIKE ?"); params.append(f"%{item_name}%")
+        if item_code:   conds.append("la.item_code LIKE ?"); params.append(f"%{item_code}%")
         if cost_center: conds.append("(la.cost_center=? OR la.cost_center_name LIKE ?)"); params += [cost_center, f"%{cost_center}%"]
         if lot_no:      conds.append("la.lot_no LIKE ?");     params.append(f"%{lot_no}%")
         where = " AND ".join(conds)
@@ -1267,7 +1373,7 @@ async def inventory_no_plan(
         rows = conn.execute(f"""
             SELECT la.factory, la.item_type, la.item_code, la.item_name,
                    COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
-                   la.lot_no, la.weight_ton, la.amount, la.base_date, la.is_new
+                   la.lot_no, la.weight_ton, la.amount, la.base_date, la.is_new, la.months_label
             FROM ({_lot_agg_subquery()}) la WHERE {where}
             ORDER BY la.amount DESC LIMIT ? OFFSET ?
         """, [ref_date] + params + [page_size, offset]).fetchall()
@@ -1289,6 +1395,7 @@ async def get_plans(
     dept: Optional[str] = Query(None), plan_type: Optional[str] = Query(None),
     lot_no: Optional[str] = Query(None), lot_no_exact: Optional[str] = Query(None),
     item_name: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
+    item_code: Optional[str] = Query(None),
     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500),
     unit: str = Query("HM"),
 ):
@@ -1301,7 +1408,7 @@ async def get_plans(
             rows = conn.execute(f"""
                 SELECT la.factory, la.item_type, la.item_code, la.item_name,
                        COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
-                       la.lot_no, la.weight_ton, la.amount, la.base_date,
+                       la.lot_no, la.weight_ton, la.amount, la.base_date, la.months_label,
                        p.dept, p.reason, p.plan_type, p.plan_date, p.detail_plan,
                        p.created_by, p.created_by_name, p.created_at,
                        p.updated_by, p.updated_by_name, p.updated_at
@@ -1323,6 +1430,7 @@ async def get_plans(
         if plan_type:   conds.append("p.plan_type=?");         params.append(plan_type)
         if lot_no:      conds.append("la.lot_no LIKE ?");      params.append(f"%{lot_no}%")
         if item_name:   conds.append("la.item_name LIKE ?");   params.append(f"%{item_name}%")
+        if item_code:   conds.append("la.item_code LIKE ?");   params.append(f"%{item_code}%")
         if cost_center: conds.append("(la.cost_center=? OR la.cost_center_name LIKE ?)"); params += [cost_center, f"%{cost_center}%"]
         where = " AND ".join(conds)
         offset = (page - 1) * page_size
@@ -1334,7 +1442,7 @@ async def get_plans(
         rows = conn.execute(f"""
             SELECT la.factory, la.item_type, la.item_code, la.item_name,
                    COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
-                   la.lot_no, la.weight_ton, la.amount, la.base_date,
+                   la.lot_no, la.weight_ton, la.amount, la.base_date, la.months_label,
                    p.dept, p.reason, p.plan_type, p.plan_date, p.detail_plan,
                    p.created_by, p.created_by_name, p.created_at AS plan_created_at,
                    p.updated_by, p.updated_by_name, p.updated_at AS plan_updated_at
@@ -1431,7 +1539,7 @@ async def delete_plan(lot_no: str, request: Request):
 @router.get("/compare")
 async def compare_plan_actual(
     ref_date: Optional[str] = Query(None), factory: Optional[str] = Query(None),
-    dept: Optional[str] = Query(None),
+    dept: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500),
     unit: str = Query("HM"),
 ):
@@ -1439,17 +1547,19 @@ async def compare_plan_actual(
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
+        sql = _lot_agg_subquery(factory=factory, cost_center=cost_center)
+        lot_params = _lot_agg_params(ref_date, factory, cost_center)
+
         conds = ["1=1"]; params: list = []
-        if factory: conds.append("la.factory=?"); params.append(factory)
-        if dept:    conds.append("p.dept=?");     params.append(dept)
+        if dept: conds.append("p.dept=?"); params.append(dept)
         where = " AND ".join(conds)
         offset = (page - 1) * page_size
 
         total = conn.execute(f"""
-            SELECT COUNT(*) FROM ({_lot_agg_subquery()}) la
+            SELECT COUNT(*) FROM ({sql}) la
             JOIN depletion_plans p ON p.lot_no = la.lot_no
             WHERE {where}
-        """, [ref_date] + params).fetchone()[0]
+        """, lot_params + params).fetchone()[0]
 
         rows = conn.execute(f"""
             SELECT la.factory, la.item_type, la.item_code, la.item_name,
@@ -1461,21 +1571,25 @@ async def compare_plan_actual(
                    CASE WHEN ax.lot_no IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                    CASE WHEN ax.lot_no IS NOT NULL THEN '조치' ELSE '미조치' END AS action_status,
                    ax.id AS actual_id
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             JOIN depletion_plans p ON p.lot_no = la.lot_no
             LEFT JOIN (
                 SELECT a.*, MIN(a.id) OVER (PARTITION BY a.lot_no) AS first_id
                 FROM depletion_actuals a WHERE a.ref_date = ?
             ) ax ON ax.lot_no = la.lot_no AND ax.id = ax.first_id
             WHERE {where} ORDER BY la.amount DESC LIMIT ? OFFSET ?
-        """, [ref_date, ref_date] + params + [page_size, offset]).fetchall()
+        """, lot_params + [ref_date] + params + [page_size, offset]).fetchall()
 
         items = []
         for r in rows:
             d = dict(r)
             pt = d.get("plan_type") or ""
-            at = d.get("actual_type_manual") or d.get("actual_type") or ""
-            d["type_match"] = (pt == at) if (pt and at) else None
+            # [요구사항7] 실적유형 원본 문자열을 Sales/WIP 규칙으로 매핑한 카테고리와
+            # 계획유형을 비교해야 진짜 "계획대로 처리됐는지"를 판단할 수 있다.
+            raw_at = d.get("actual_type_manual") or d.get("actual_type") or ""
+            mapped_at = _actual_type_to_plan_type(raw_at)
+            d["actual_type_mapped"] = mapped_at
+            d["type_match"] = (pt == mapped_at) if (pt and mapped_at) else None
             d["amount"] = fmt_amount(d["amount"], unit)["value"]
             d["weight_ton"] = round(d["weight_ton"], 3)
             items.append(d)
@@ -1491,6 +1605,7 @@ async def compare_plan_actual(
 async def compare_summary(
     ref_date: Optional[str] = Query(None),
     factory: Optional[str] = Query(None),
+    cost_center: Optional[str] = Query(None),
     dept: Optional[str] = Query(None),
     unit: str = Query("HM"),
 ):
@@ -1499,9 +1614,11 @@ async def compare_summary(
         if not ref_date:
             ref_date = _latest_ref(conn)
 
+        sql = _lot_agg_subquery(factory=factory, cost_center=cost_center)
+        lot_params = _lot_agg_params(ref_date, factory, cost_center)
+
         conds = ["1=1"]; params: list = []
-        if factory: conds.append("la.factory=?"); params.append(factory)
-        if dept:    conds.append("p.dept=?");     params.append(dept)
+        if dept: conds.append("p.dept=?"); params.append(dept)
         where = " AND ".join(conds)
 
         r = conn.execute(f"""
@@ -1514,12 +1631,12 @@ async def compare_summary(
                    COALESCE(SUM(CASE WHEN ax.lot_no IS NOT NULL THEN la.amount ELSE 0 END),0) AS action_amount,
                    COALESCE(SUM(CASE WHEN ax.lot_no IS NULL THEN la.weight_ton ELSE 0 END),0) AS no_action_weight,
                    COALESCE(SUM(CASE WHEN ax.lot_no IS NULL THEN la.amount ELSE 0 END),0) AS no_action_amount
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             JOIN depletion_plans p ON p.lot_no = la.lot_no
             LEFT JOIN (SELECT DISTINCT lot_no FROM depletion_actuals WHERE ref_date=?) ax
                    ON ax.lot_no = la.lot_no
             WHERE {where}
-        """, [ref_date, ref_date] + params).fetchone()
+        """, lot_params + [ref_date] + params).fetchone()
 
         pt = max(r["plan_total"] or 1, 1)
         ac = r["action_count"] or 0
@@ -1533,9 +1650,9 @@ async def compare_summary(
                    COALESCE(SUM(la.weight_ton),0) AS plan_weight,
                    COALESCE(SUM(la.amount),0) AS plan_amount
             FROM depletion_plans p
-            LEFT JOIN ({_lot_agg_subquery()}) la ON la.lot_no = p.lot_no
+            JOIN ({sql}) la ON la.lot_no = p.lot_no
             GROUP BY p.plan_type ORDER BY plan_amount DESC
-        """, (ref_date,)).fetchall()
+        """, lot_params).fetchall()
 
         actual_rows = conn.execute("""
             SELECT COALESCE(a.actual_type_manual, a.actual_type, '기타') AS actual_type,
@@ -1568,13 +1685,18 @@ async def compare_summary(
 
 
 @router.get("/compare/export")
-async def export_compare(ref_date: Optional[str] = Query(None), unit: str = Query("HM")):
+async def export_compare(
+    ref_date: Optional[str] = Query(None), unit: str = Query("HM"),
+    factory: Optional[str] = Query(None), cost_center: Optional[str] = Query(None),
+):
     conn = get_conn()
     try:
         if not ref_date:
             ref_date = _latest_ref(conn)
         if not ref_date:
             raise HTTPException(404, "데이터가 없습니다.")
+        sql = _lot_agg_subquery(factory=factory, cost_center=cost_center)
+        lot_params = _lot_agg_params(ref_date, factory, cost_center)
         rows = conn.execute(f"""
             SELECT la.factory, la.item_type, la.item_code, la.item_name,
                    COALESCE(la.cost_center_name, la.cost_center) AS cc_name,
@@ -1583,14 +1705,14 @@ async def export_compare(ref_date: Optional[str] = Query(None), unit: str = Quer
                    COALESCE(ax.actual_type_manual, ax.actual_type, '') AS actual_type,
                    ax.process_date,
                    CASE WHEN ax.lot_no IS NOT NULL THEN '조치' ELSE '미조치' END AS action_status
-            FROM ({_lot_agg_subquery()}) la
+            FROM ({sql}) la
             JOIN depletion_plans p ON p.lot_no = la.lot_no
             LEFT JOIN (
                 SELECT a.*, MIN(a.id) OVER (PARTITION BY a.lot_no) AS first_id
                 FROM depletion_actuals a WHERE a.ref_date=?
             ) ax ON ax.lot_no = la.lot_no AND ax.id = ax.first_id
             WHERE 1=1 ORDER BY la.amount DESC
-        """, (ref_date, ref_date)).fetchall()
+        """, lot_params + [ref_date]).fetchall()
         conn.close()
         data = [dict(r) for r in rows]
         for d in data:
